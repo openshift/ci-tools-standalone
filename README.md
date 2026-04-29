@@ -25,10 +25,30 @@ make build-all
 # Build a single tool
 make build-backport-verifier
 
-# Run tests
+# Install all binaries to $GOPATH/bin
+make production-install
+```
+
+## Testing
+
+```bash
+# Run all unit tests
 make test
 
-# Build a container image
+# Check Go source formatting
+make format
+
+# Run linter (uses golangci-lint via container locally, directly in CI)
+make lint
+
+# Verify vendor directory is up to date
+make validate-vendor
+```
+
+## Container images
+
+```bash
+# Build a container image for a specific tool
 make image-publicize
 ```
 
@@ -36,6 +56,13 @@ make image-publicize
 
 ```
 cmd/                    One subdirectory per tool
-internal/               Tool internals, small helper functions
+internal/               Repo-private shared packages
+  gzip/                 Gzip decompression utility
+  helpdeskfaq/          Helpdesk FAQ client and types
+  prreminder/           PR reminder Rover types
+  retester/             Retester logic and caches
 images/                 Dockerfiles per tool
+hack/                   Build and CI scripts
+vendor/                 Vendored dependencies
+ci-operator/            CI configuration for openshift/release
 ```
