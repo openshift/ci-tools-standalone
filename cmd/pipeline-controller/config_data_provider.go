@@ -121,4 +121,3 @@ func (c *ConfigDataProvider) gatherDataForRepos(orgRepos []string) {
 	defer c.m.Unlock()
 	c.updatedPresubmits = updatedPresubmits
 }
-

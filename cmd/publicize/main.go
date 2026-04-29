@@ -127,7 +127,7 @@ func (o *options) getConfigWatchAndUpdate() (func(ctx context.Context), error) {
 	eventFunc := func() error {
 		bytes, err := gzip.ReadFileMaybeGZIP(o.configPath)
 		if err != nil {
-			return fmt.Errorf("Couldn't read publicize configuration file %s: %w", o.configPath, err)
+			return fmt.Errorf("couldn't read publicize configuration file %s: %w", o.configPath, err)
 		}
 
 		var c *Config

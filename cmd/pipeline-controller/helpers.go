@@ -186,4 +186,3 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 	}
 	return testCommands, "", nil
 }
-
