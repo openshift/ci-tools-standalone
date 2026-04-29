@@ -36,6 +36,6 @@ make image-publicize
 
 ```
 cmd/                    One subdirectory per tool
-internal/gzip/          Shared gzip decompression utility (repo-private)
+internal/               Tool internals, small helper functions
 images/                 Dockerfiles per tool
 ```
