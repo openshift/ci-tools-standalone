@@ -258,7 +258,7 @@ func (r *reconciler) reportSuccessOnPR(ctx context.Context, pj *v1.ProwJob, pres
 	}
 	selector := map[string]string{}
 	for _, l := range []string{kube.OrgLabel, kube.RepoLabel, kube.PullLabel, kube.BaseRefLabel} {
-		selector[l] = pj.ObjectMeta.Labels[l]
+		selector[l] = pj.Labels[l]
 	}
 	// Only list presubmit jobs - postsubmits, periodics, and batch jobs are not relevant
 	selector[kube.ProwJobTypeLabel] = string(v1.PresubmitJob)

@@ -205,4 +205,3 @@ func runWebhookServer(cert *tls.Certificate) {
 func main() {
 	Execute()
 }
-

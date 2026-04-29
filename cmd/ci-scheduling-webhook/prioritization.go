@@ -1318,4 +1318,3 @@ func (p *Prioritization) findHostnamesToPreclude(podClass PodClass) []string {
 	klog.Infof("Precluding hostnames for podClass %v: %v", podClass, hostnamesToPreclude)
 	return hostnamesToPreclude
 }
-

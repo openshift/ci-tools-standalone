@@ -41,7 +41,7 @@ func TestCheckPrerequisites(t *testing.T) {
 			commentBody:   "/publicize",
 			isMember:      true,
 			repositories:  map[string]string{"org-priv/repo": "org/repo"},
-			expectedError: errors.New("Publicize plugin can only be used in pull requests"),
+			expectedError: errors.New("publicize plugin can only be used in pull requests"),
 		},
 		{
 			id:            "user is no org member",
