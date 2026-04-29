@@ -316,4 +316,3 @@ func (r *reconciler) reportSuccessOnPR(ctx context.Context, pj *v1.ProwJob, pres
 	}
 	return true, nil
 }
-
