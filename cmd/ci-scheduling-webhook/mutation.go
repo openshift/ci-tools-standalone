@@ -680,4 +680,3 @@ func mutateNode(admissionReviewRequest *admissionv1.AdmissionReview, w http.Resp
 		klog.Errorf("Unable to respond to caller with admission review: %v", err)
 	}
 }
-

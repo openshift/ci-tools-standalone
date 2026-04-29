@@ -13,7 +13,6 @@ import (
 
 	prowConfig "sigs.k8s.io/prow/pkg/config"
 	"sigs.k8s.io/prow/pkg/flagutil"
-	prowflagutil "sigs.k8s.io/prow/pkg/flagutil"
 	configflagutil "sigs.k8s.io/prow/pkg/flagutil/config"
 	"sigs.k8s.io/prow/pkg/interrupts"
 	"sigs.k8s.io/prow/pkg/metrics"
@@ -23,7 +22,7 @@ import (
 
 type options struct {
 	config configflagutil.ConfigOptions
-	github prowflagutil.GitHubOptions
+	github flagutil.GitHubOptions
 
 	runOnce bool
 	dryRun  bool
@@ -136,7 +135,7 @@ func main() {
 
 	c := retester.NewController(ctx, gc, configAgent.Config, gitClient, o.github.AppPrivateKeyPath != "", o.cacheFile, o.cacheRecordAge, config, &awsConfig)
 
-	metrics.ExposeMetrics("retester", prowConfig.PushGateway{}, prowflagutil.DefaultMetricsPort)
+	metrics.ExposeMetrics("retester", prowConfig.PushGateway{}, flagutil.DefaultMetricsPort)
 
 	interrupts.OnInterrupt(func() {
 		if err := gitClient.Clean(); err != nil {

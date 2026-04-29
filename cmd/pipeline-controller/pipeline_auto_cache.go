@@ -58,4 +58,3 @@ func (c *PipelineAutoCache) CleanExpired() {
 		return true
 	})
 }
-

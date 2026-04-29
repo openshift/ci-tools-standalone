@@ -52,7 +52,7 @@ func (o *options) validate() error {
 		return fmt.Errorf("--slack-token-path is required")
 	}
 
-	return o.GitHubOptions.Validate(false)
+	return o.Validate(false)
 }
 
 func parseOptions() (options, error) {
@@ -64,7 +64,7 @@ func parseOptions() (options, error) {
 	fs.BoolVar(&o.validateOnly, "validate-only", false, "Run the tool in validate-only mode. This will simply validate the config.")
 	fs.StringVar(&o.logLevel, "log-level", "info", "Level at which to log output.")
 
-	o.GitHubOptions.AddFlags(fs)
+	o.AddFlags(fs)
 	return o, fs.Parse(os.Args[1:])
 }
 
@@ -340,7 +340,7 @@ func main() {
 		channels := c.channels()
 
 		if len(users) > 0 || len(channels) > 0 {
-			ghClient, err := o.GitHubOptions.GitHubClient(false)
+			ghClient, err := o.GitHubClient(false)
 			if err != nil {
 				logrus.WithError(err).Fatal("failed to create github client")
 			}
@@ -434,7 +434,7 @@ func findPRs(users map[string]user, channels map[string][]repoChannel, ghClient 
 			org, repo := split[0], split[1]
 
 			for _, pr := range repoToPRs[cfg.orgRepo] {
-				if isUnreviewed(org, repo, pr, ghClient) && !hasUnactionableLabels(pr.Labels) && !(cfg.omitBots && pr.User.Type == github.UserTypeBot) {
+				if isUnreviewed(org, repo, pr, ghClient) && !hasUnactionableLabels(pr.Labels) && (!cfg.omitBots || pr.User.Type != github.UserTypeBot) {
 					if _, recorded := channelToPRs[channel]; !recorded {
 						channelToPRs[channel] = []prRequest{}
 					}

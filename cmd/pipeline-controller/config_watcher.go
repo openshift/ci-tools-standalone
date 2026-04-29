@@ -153,4 +153,3 @@ func (w *watcher) getConfig() map[string]map[string]RepoConfig {
 	}
 	return ret
 }
-
