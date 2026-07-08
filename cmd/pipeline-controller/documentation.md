@@ -103,7 +103,7 @@ Note: If a test is marked as `optional: true`, it will not be considered an alwa
 
 ## Conditional Test Annotations
 
-The pipeline controller supports two conditional annotations that allow tests to run based on file changes in the pull request:
+The pipeline controller supports three conditional annotations that allow tests to run based on file changes in the pull request:
 
 ### `pipeline_run_if_changed`
 
@@ -165,13 +165,44 @@ Add the annotation to your test configuration in the ci-operator config file:
   - `^(docs|\.github)/` - matches files in `docs/` or `.github/` directories
   - `^(?:docs|\.github)/|\.md$` - matches files in `docs/` or `.github/` directories OR any `.md` file
 
+### `pipeline_run_if_dockerfile_changed`
+
+This annotation specifies that a test should run **only if** files that feed into the specified Dockerfile(s) have changed. Instead of hand-maintaining regex patterns, the pipeline controller automatically determines which files matter by parsing the Dockerfile's `COPY` and `ADD` instructions.
+
+**How it works:**
+- The controller fetches each listed Dockerfile from the base branch and parses its `COPY`/`ADD` instructions
+- If any changed file falls within a source path referenced by a `COPY` or `ADD` instruction, the test will be triggered
+- The test always runs if any of these files changed: the Dockerfile itself, `.dockerignore`, `go.mod`, `go.sum`, or `Makefile`
+- `COPY --from=<stage>` instructions (inter-stage copies) are ignored — only copies from the build context are considered
+- `.dockerignore` rules are applied: files excluded by `.dockerignore` will not trigger the test
+- If the Dockerfile contains `COPY . .` (broad copy), the test is conservatively triggered for any file change
+
+**How to add it:**
+
+Add the field to your test configuration in the ci-operator config file:
+
+```yaml
+- always_run: false
+  as: e2e-aws
+  pipeline_run_if_dockerfile_changed:
+    - path: Dockerfile
+    - path: Dockerfile.control-plane
+  steps:
+    workflow: hypershift-hostedcluster-e2e-aws
+```
+
+**When to use instead of `pipeline_run_if_changed` or `pipeline_skip_if_only_changed`:**
+- When your test depends on a container image build and you want the skip/run decision to be derived from the Dockerfile rather than hand-maintained regex
+- When your Dockerfile uses selective `COPY` instructions (e.g., `COPY cmd/ cmd/`, `COPY pkg/ pkg/`) — the controller can automatically determine the relevant source paths
+- When you want changes to build infrastructure (`go.mod`, `Makefile`, `.dockerignore`) to always trigger the test
+
 ### Best Practices for Conditional Annotations
 
 1. **Use `pipeline_run_if_changed` for focused tests**: Use this when a test is only relevant when specific files change (e.g., build-related tests only when build code changes).
 
 2. **Use `pipeline_skip_if_only_changed` for broad tests**: Use this when a test should run most of the time, but can be safely skipped for documentation-only changes.
 
-3. **Don't use both annotations**: If both `pipeline_run_if_changed` and `pipeline_skip_if_only_changed` are present, `pipeline_run_if_changed` takes precedence.
+3. **Don't combine conditional annotations**: `pipeline_run_if_changed`, `pipeline_skip_if_only_changed`, and `pipeline_run_if_dockerfile_changed` are mutually exclusive on a single test.
 
 4. **Test your patterns**: Ensure your regex patterns correctly match the files you intend. You can test regex patterns using online regex testers or by examining PRs where the test should or shouldn't run.
 
