@@ -91,13 +91,22 @@ func (c *ConfigDataProvider) gatherDataForRepos(orgRepos []string) {
 					updatedPresubmits[orgRepo] = pre
 					continue
 				}
+				// Check for pipeline_run_if_dockerfile_changed annotation
+				if val, ok := p.Annotations["pipeline_run_if_dockerfile_changed"]; ok && val != "" {
+					pre := updatedPresubmits[orgRepo]
+					pre.pipelineConditionallyRequired = append(pre.pipelineConditionallyRequired, p)
+					updatedPresubmits[orgRepo] = pre
+					continue
+				}
 				// Only categorize as protected if it doesn't have pipeline annotations
 				if !p.Optional {
 					if _, hasPipelineRun := p.Annotations["pipeline_run_if_changed"]; !hasPipelineRun {
 						if _, hasPipelineSkip := p.Annotations["pipeline_skip_if_only_changed"]; !hasPipelineSkip {
-							pre := updatedPresubmits[orgRepo]
-							pre.protected = append(pre.protected, p)
-							updatedPresubmits[orgRepo] = pre
+							if _, hasDockerfile := p.Annotations["pipeline_run_if_dockerfile_changed"]; !hasDockerfile {
+								pre := updatedPresubmits[orgRepo]
+								pre.protected = append(pre.protected, p)
+								updatedPresubmits[orgRepo] = pre
+							}
 						}
 					}
 				}

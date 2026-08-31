@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -19,6 +20,7 @@ type minimalGhClient interface {
 	CreateStatus(org, repo, ref string, s github.Status) error
 	AddLabel(org, repo string, number int, label string) error
 	GetIssueLabels(org, repo string, number int) ([]github.Label, error)
+	GetFile(org, repo, filepath, commit string) ([]byte, error)
 }
 
 func sendComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader) error {
@@ -71,7 +73,7 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 			if protectedCommands != "" {
 				comment += "\n"
 			}
-			comment += "\nScheduling tests matching the `pipeline_run_if_changed` or not excluded by `pipeline_skip_if_only_changed` parameters:"
+			comment += "\nScheduling tests matching the `pipeline_run_if_changed`, `pipeline_run_if_dockerfile_changed`, or not excluded by `pipeline_skip_if_only_changed` parameters:"
 			comment += testContexts
 		}
 	}
@@ -134,6 +136,18 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 					return "", "", err
 				}
 				shouldRun = shouldRunResult
+			} else if dockerfileAnnotation, ok := presubmit.Annotations["pipeline_run_if_dockerfile_changed"]; ok && dockerfileAnnotation != "" {
+				var entries []dockerfileEntry
+				if err := json.Unmarshal([]byte(dockerfileAnnotation), &entries); err != nil {
+					deleteIds()
+					return "", "", fmt.Errorf("failed to parse pipeline_run_if_dockerfile_changed annotation: %w", err)
+				}
+				changedFiles, err := cfp()
+				if err != nil {
+					deleteIds()
+					return "", "", err
+				}
+				shouldRun = evaluateDockerfileChanges(entries, changedFiles, pj, ghc)
 			} else {
 				shouldRun = true
 			}
