@@ -592,8 +592,9 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 		deleteIds = func() { cw.ids.Delete(key) }
 	}
 
-	// Generate the comment with test/override commands.
-	if err := sendCommentWithMode(presubmits, prowJob, cw.ghc, deleteIds, cw.pjLister, mode); err != nil {
+	// Generate the comment with test/override commands. explicit=true: a human
+	// /pipeline command always gets a response, even when nothing needs scheduling.
+	if err := sendCommentWithMode(presubmits, prowJob, cw.ghc, deleteIds, cw.pjLister, mode, true); err != nil {
 		logger.WithError(err).Error("failed to send comment in response to pipeline command")
 	}
 }

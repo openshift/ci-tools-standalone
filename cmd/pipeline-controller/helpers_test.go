@@ -208,7 +208,7 @@ func TestSendCommentWithMode_ProtectedDedup(t *testing.T) {
 			deleteIdsCalled := false
 			deleteIds := func() { deleteIdsCalled = true }
 
-			err := sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, tc.mode)
+			err := sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, tc.mode, true)
 			if err != nil {
 				t.Fatalf("sendCommentWithMode returned error: %v", err)
 			}
@@ -319,7 +319,7 @@ func TestSendCommentWithMode_ConditionalDelta(t *testing.T) {
 			presubmits := presubmitTests{pipelineConditionallyRequired: conditionalPresubmits}
 			pj := makeTriggerPJ(sha)
 
-			if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, tc.mode); err != nil {
+			if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, tc.mode, true); err != nil {
 				t.Fatalf("sendCommentWithMode returned error: %v", err)
 			}
 			if len(ghc.comments) != 1 {
@@ -381,7 +381,7 @@ func TestSendCommentWithMode_DeltaDoesNotSuppressProtected(t *testing.T) {
 	pjLister := newFakePJLister(makeProwJob(conditionalJob, sha))
 	pj := makeTriggerPJ(sha)
 
-	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta); err != nil {
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta, true); err != nil {
 		t.Fatalf("sendCommentWithMode returned error: %v", err)
 	}
 	if len(ghc.comments) != 1 {
@@ -432,7 +432,7 @@ func TestSendCommentWithMode_DeltaListErrorFailsClosed(t *testing.T) {
 	pj := makeTriggerPJ(sha)
 
 	deleteIdsCalled := false
-	err := sendCommentWithMode(presubmits, pj, ghc, func() { deleteIdsCalled = true }, errorLister{}, modeDelta)
+	err := sendCommentWithMode(presubmits, pj, ghc, func() { deleteIdsCalled = true }, errorLister{}, modeDelta, true)
 	if err == nil {
 		t.Fatal("expected an error from modeDelta list failure, got nil")
 	}
@@ -466,7 +466,7 @@ func TestSendCommentWithMode_DeltaNilListerNoPanic(t *testing.T) {
 	ghc := &fakeGhClient{changes: []github.PullRequestChange{{Filename: "cmd/main.go"}}}
 	pj := makeTriggerPJ(sha)
 
-	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, nil, modeDelta); err != nil {
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, nil, modeDelta, true); err != nil {
 		t.Fatalf("sendCommentWithMode returned error: %v", err)
 	}
 	if len(ghc.comments) != 1 || !strings.Contains(ghc.comments[0], "/test "+conditionalJob) {
@@ -500,7 +500,7 @@ func TestSendCommentWithMode_DeltaNewHeadReEvaluates(t *testing.T) {
 	pjLister := newFakePJLister(makeProwJob(conditionalJob, oldSHA))
 	pj := makeTriggerPJ(newSHA)
 
-	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta); err != nil {
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta, true); err != nil {
 		t.Fatalf("sendCommentWithMode returned error: %v", err)
 	}
 	if len(ghc.comments) != 1 || !strings.Contains(ghc.comments[0], "/test "+conditionalJob) {
@@ -545,7 +545,7 @@ func TestSendCommentWithMode_DeltaEmptyWithOnlyFirstStageJobs(t *testing.T) {
 	pjLister := newFakePJLister(makeProwJob(firstStageJob, sha))
 	pj := makeTriggerPJ(sha)
 
-	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta); err != nil {
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta, true); err != nil {
 		t.Fatalf("sendCommentWithMode returned error: %v", err)
 	}
 	if len(ghc.comments) != 1 {
@@ -557,6 +557,50 @@ func TestSendCommentWithMode_DeltaEmptyWithOnlyFirstStageJobs(t *testing.T) {
 	}
 	if strings.Contains(comment, "already been triggered") {
 		t.Errorf("first-stage jobs must not trigger the already-triggered message, got: %q", comment)
+	}
+}
+
+// TestSendCommentWithMode_ImplicitEmptyIsSilent verifies that an automatic
+// trigger (explicit=false, as used by the reconciler auto path and LGTM) posts
+// NO comment when there is nothing to schedule, while an explicit /pipeline
+// command (explicit=true) still gets the "already been triggered" acknowledgment
+// for the same state. This prevents fleet-wide duplicate "nothing to do" notes.
+func TestSendCommentWithMode_ImplicitEmptyIsSilent(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+	)
+
+	conditionalJob := fmt.Sprintf("pull-ci-%s-%s-%s-conditional", org, repo, baseRef)
+	presubmits := presubmitTests{
+		pipelineConditionallyRequired: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: conditionalJob, Annotations: map[string]string{"pipeline_run_if_changed": "^cmd/"}},
+			Reporter:     config.Reporter{Context: conditionalJob},
+			RerunCommand: "/test " + conditionalJob,
+		}},
+	}
+	changes := []github.PullRequestChange{{Filename: "cmd/main.go"}}
+	// The one applicable second-stage job already exists at HEAD -> empty delta.
+	existing := []v1.ProwJob{makeProwJob(conditionalJob, sha)}
+
+	// Implicit (automatic) trigger: must stay silent.
+	ghcImplicit := &fakeGhClient{changes: changes}
+	if err := sendCommentWithMode(presubmits, makeTriggerPJ(sha), ghcImplicit, func() {}, newFakePJLister(existing...), modeDelta, false); err != nil {
+		t.Fatalf("sendCommentWithMode(implicit) returned error: %v", err)
+	}
+	if len(ghcImplicit.comments) != 0 {
+		t.Errorf("expected NO comment on an automatic empty-delta trigger, got %d: %v", len(ghcImplicit.comments), ghcImplicit.comments)
+	}
+
+	// Explicit command for the same state: still acknowledges.
+	ghcExplicit := &fakeGhClient{changes: changes}
+	if err := sendCommentWithMode(presubmits, makeTriggerPJ(sha), ghcExplicit, func() {}, newFakePJLister(existing...), modeDelta, true); err != nil {
+		t.Fatalf("sendCommentWithMode(explicit) returned error: %v", err)
+	}
+	if len(ghcExplicit.comments) != 1 || !strings.Contains(ghcExplicit.comments[0], "already been triggered") {
+		t.Errorf("expected an explicit command to still post the already-triggered ack, got: %v", ghcExplicit.comments)
 	}
 }
 

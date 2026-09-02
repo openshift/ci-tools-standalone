@@ -34,10 +34,19 @@ type minimalGhClient interface {
 }
 
 func sendComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader) error {
-	return sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, modeDelta)
+	// Automatic triggers (reconciler auto path, LGTM) are implicit: explicit=false.
+	return sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, modeDelta, false)
 }
 
-func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, mode scheduleMode) error {
+// sendCommentWithMode plans and posts the second-stage scheduling comment.
+// explicit is true when the run was requested by a human /pipeline command; it
+// controls whether a "nothing to schedule" acknowledgment is posted. Automatic
+// triggers (explicit=false) stay silent when there is nothing to schedule, so
+// the controller only comments when it actually acts — this avoids fleet-wide
+// duplicate "already triggered"/"no tests" notes that otherwise recur on every
+// reconcile/LGTM pass and across restarts (the per-handler dedup caches are
+// separate and in-memory).
+func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, mode scheduleMode, explicit bool) error {
 	if pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) == 0 {
 		deleteIds()
 		return fmt.Errorf("ProwJob %s does not have valid Refs.Pulls", pj.Name)
@@ -86,11 +95,15 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 		comment += testContexts
 	}
 
-	// If nothing was scheduled, post an informative comment instead of staying
-	// silent. In modeDelta the empty result can mean the second stage was already
-	// triggered earlier for this HEAD; in that case avoid the misleading "no
-	// second-stage tests were triggered" wording.
+	// Nothing was scheduled. Automatic triggers stay silent (they only announce
+	// real scheduling); explicit /pipeline commands get an acknowledgment. In
+	// modeDelta the empty result can mean the second stage was already triggered
+	// earlier for this HEAD; in that case avoid the misleading "no second-stage
+	// tests were triggered" wording.
 	if comment == "" {
+		if !explicit {
+			return nil
+		}
 		if mode == modeDelta && secondStageTriggeredAtSHA(context.Background(), pjLister, pj, presubmits) {
 			comment = fmt.Sprintf("**Pipeline controller notification**\n\nAll applicable second-stage tests for this HEAD have already been triggered. Nothing new to schedule.\n\nUse `/test ?` to see all available tests, or `/pipeline required` to re-run the full required set for the `%s` branch.", pj.Spec.Refs.BaseRef)
 		} else {
