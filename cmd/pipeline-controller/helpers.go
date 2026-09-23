@@ -33,6 +33,74 @@ type minimalGhClient interface {
 	GetIssueLabels(org, repo string, number int) ([]github.Label, error)
 }
 
+func hasRequiredLabels(requiredLabels []string, labels []github.Label) bool {
+	if len(requiredLabels) == 0 {
+		return true
+	}
+
+	present := make(map[string]struct{}, len(labels))
+	for _, label := range labels {
+		present[label.Name] = struct{}{}
+	}
+	for _, label := range requiredLabels {
+		if _, ok := present[label]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func requiredLabelsPresent(ghc minimalGhClient, refs *v1.Refs, requiredLabels []string) (bool, error) {
+	if len(requiredLabels) == 0 {
+		return true, nil
+	}
+	if refs == nil || len(refs.Pulls) == 0 {
+		return false, fmt.Errorf("ProwJob has no pull request references")
+	}
+
+	labels, err := ghc.GetIssueLabels(refs.Org, refs.Repo, refs.Pulls[0].Number)
+	if err != nil {
+		return false, fmt.Errorf("getting pull request labels: %w", err)
+	}
+	return hasRequiredLabels(requiredLabels, labels), nil
+}
+
+func pipelineRequiredLabels(presubmit config.Presubmit) []string {
+	value := presubmit.Annotations["pipeline_required_labels"]
+	if value == "" {
+		return nil
+	}
+
+	var required []string
+	for _, label := range strings.Split(value, ",") {
+		if label = strings.TrimSpace(label); label != "" {
+			required = append(required, label)
+		}
+	}
+	return required
+}
+
+func filterPresubmitsByRequiredLabels(presubmits []config.Presubmit, labels []github.Label) []config.Presubmit {
+	filtered := make([]config.Presubmit, 0, len(presubmits))
+	for _, presubmit := range presubmits {
+		if hasRequiredLabels(pipelineRequiredLabels(presubmit), labels) {
+			filtered = append(filtered, presubmit)
+		}
+	}
+	return filtered
+}
+
+func hasPipelineRequiredLabels(presubmits presubmitTests) bool {
+	for _, group := range [][]config.Presubmit{presubmits.protected, presubmits.pipelineConditionallyRequired, presubmits.pipelineSkipOnlyRequired} {
+		for _, presubmit := range group {
+			if len(pipelineRequiredLabels(presubmit)) != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func sendComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader) error {
 	// Automatic triggers (reconciler auto path, LGTM) are implicit: explicit=false.
 	return sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, modeDelta, false)
@@ -50,6 +118,17 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 	if pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) == 0 {
 		deleteIds()
 		return fmt.Errorf("ProwJob %s does not have valid Refs.Pulls", pj.Name)
+	}
+
+	if hasPipelineRequiredLabels(presubmits) {
+		labels, err := ghc.GetIssueLabels(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number)
+		if err != nil {
+			deleteIds()
+			return fmt.Errorf("getting pull request labels: %w", err)
+		}
+		presubmits.protected = filterPresubmitsByRequiredLabels(presubmits.protected, labels)
+		presubmits.pipelineConditionallyRequired = filterPresubmitsByRequiredLabels(presubmits.pipelineConditionallyRequired, labels)
+		presubmits.pipelineSkipOnlyRequired = filterPresubmitsByRequiredLabels(presubmits.pipelineSkipOnlyRequired, labels)
 	}
 
 	// Combine pipelineConditionallyRequired and pipelineSkipOnlyRequired for processing

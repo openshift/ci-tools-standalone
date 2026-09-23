@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -27,6 +28,23 @@ orgs:
 		t.Fatalf("failed to parse enabled config: %v", err)
 	}
 	return enabled
+}
+
+func testRepo(t *testing.T) github.Repo {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"owner": map[string]string{"login": "openshift"},
+		"name":  "myrepo",
+	})
+	if err != nil {
+		t.Fatalf("marshal test repository: %v", err)
+	}
+
+	var result github.Repo
+	if err := json.Unmarshal(payload, &result); err != nil {
+		t.Fatalf("unmarshal test repository: %v", err)
+	}
+	return result
 }
 
 // TestHandleLabelAdditionLGTMIdempotent verifies that the LGTM scheduling path is
@@ -65,7 +83,7 @@ func TestHandleLabelAdditionLGTMIdempotent(t *testing.T) {
 	event := github.PullRequestEvent{
 		Action: github.PullRequestActionLabeled,
 		Label:  github.Label{Name: labels.LGTM},
-		Repo:   github.Repo{Owner: github.User{Login: org}, Name: repo},
+		Repo:   testRepo(t),
 		PullRequest: github.PullRequest{
 			Number: prNum,
 			Base:   github.PullRequestBranch{Ref: baseRef, SHA: "base-sha"},
@@ -127,7 +145,7 @@ func TestHandleIssueCommentRemainingDeltaAndIdempotent(t *testing.T) {
 	}
 
 	event := github.IssueCommentEvent{
-		Repo:    github.Repo{Owner: github.User{Login: org}, Name: repo},
+		Repo:    testRepo(t),
 		Issue:   github.Issue{Number: prNum, PullRequest: &struct{}{}},
 		Comment: github.IssueComment{Body: "/pipeline remaining"},
 	}
@@ -208,7 +226,7 @@ func TestHandleIssueCommentAutoImmediateTriggerUsesDelta(t *testing.T) {
 	}
 
 	event := github.IssueCommentEvent{
-		Repo:    github.Repo{Owner: github.User{Login: org}, Name: repo},
+		Repo:    testRepo(t),
 		Issue:   github.Issue{Number: prNum, PullRequest: &struct{}{}},
 		Comment: github.IssueComment{Body: "/pipeline auto"},
 	}
@@ -263,7 +281,7 @@ func TestHandleIssueCommentRequiredForcesAll(t *testing.T) {
 	}
 
 	event := github.IssueCommentEvent{
-		Repo:    github.Repo{Owner: github.User{Login: org}, Name: repo},
+		Repo:    testRepo(t),
 		Issue:   github.Issue{Number: prNum, PullRequest: &struct{}{}},
 		Comment: github.IssueComment{Body: "/pipeline required"},
 	}

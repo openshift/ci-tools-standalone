@@ -21,6 +21,7 @@ type fakeGhClient struct {
 	comments    []string
 	changes     []github.PullRequestChange
 	pullRequest *github.PullRequest
+	labels      []github.Label
 	addedLabels []string
 }
 
@@ -50,7 +51,44 @@ func (f *fakeGhClient) AddLabel(org, repo string, number int, label string) erro
 }
 
 func (f *fakeGhClient) GetIssueLabels(org, repo string, number int) ([]github.Label, error) {
-	return nil, nil
+	return f.labels, nil
+}
+
+func TestHasRequiredLabels(t *testing.T) {
+	labels := []github.Label{{Name: "approved"}, {Name: "acknowledge-critical-fixes-only"}}
+	if !hasRequiredLabels([]string{"acknowledge-critical-fixes-only"}, labels) {
+		t.Fatal("expected acknowledgement label to satisfy requirement")
+	}
+	if hasRequiredLabels([]string{"acknowledge-critical-fixes-only", "lgtm"}, labels) {
+		t.Fatal("expected missing lgtm label to reject requirement")
+	}
+}
+
+func TestSendCommentFiltersPipelineRequiredLabels(t *testing.T) {
+	presubmits := presubmitTests{protected: []config.Presubmit{{
+		JobBase: config.JobBase{
+			Name:        "pull-ci-openshift-myrepo-main-e2e",
+			Annotations: map[string]string{"pipeline_required_labels": "label-a,label-b"},
+		},
+		RerunCommand: "/test e2e",
+	}}}
+	pj := makeTriggerPJ("abc1234567890")
+
+	withoutLabels := &fakeGhClient{}
+	if err := sendComment(presubmits, pj, withoutLabels, func() {}, nil); err != nil {
+		t.Fatalf("send comment without labels: %v", err)
+	}
+	if len(withoutLabels.comments) != 0 {
+		t.Fatalf("scheduled a label-gated job without labels: %v", withoutLabels.comments)
+	}
+
+	withLabels := &fakeGhClient{labels: []github.Label{{Name: "label-a"}, {Name: "label-b"}}}
+	if err := sendComment(presubmits, pj, withLabels, func() {}, nil); err != nil {
+		t.Fatalf("send comment with labels: %v", err)
+	}
+	if len(withLabels.comments) != 1 || !strings.Contains(withLabels.comments[0], "/test e2e") {
+		t.Fatalf("did not schedule the label-gated job: %v", withLabels.comments)
+	}
 }
 
 func newFakePJLister(pjs ...v1.ProwJob) ctrlruntimeclient.Reader {

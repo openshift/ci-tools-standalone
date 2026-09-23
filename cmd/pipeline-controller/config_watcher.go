@@ -15,7 +15,8 @@ type RepoItem struct {
 	Name     string
 	Branches []string
 	Mode     struct {
-		Trigger string
+		Trigger        string
+		RequiredLabels []string
 	}
 }
 
@@ -34,7 +35,8 @@ func (r *RepoItem) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		Name     string   `yaml:"name"`
 		Branches []string `yaml:"branches,omitempty"`
 		Mode     struct {
-			Trigger string `yaml:"trigger"`
+			Trigger        string   `yaml:"trigger"`
+			RequiredLabels []string `yaml:"required_labels,omitempty"`
 		} `yaml:"mode,omitempty"`
 	}
 	var raw rawRepo
@@ -45,6 +47,7 @@ func (r *RepoItem) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	r.Name = raw.Name
 	r.Branches = raw.Branches
 	r.Mode.Trigger = raw.Mode.Trigger
+	r.Mode.RequiredLabels = raw.Mode.RequiredLabels
 	if r.Mode.Trigger == "" {
 		r.Mode.Trigger = "auto" // default to auto if not specified
 	}
@@ -59,10 +62,10 @@ type enabledConfig struct {
 	} `yaml:"orgs"`
 }
 
-// RepoConfig contains configuration for a single repository
 type RepoConfig struct {
-	Trigger  string
-	Branches []string // If empty, all branches are enabled
+	Trigger        string
+	RequiredLabels []string
+	Branches       []string // If empty, all branches are enabled
 }
 
 // watcher struct encapsulates the file watcher and configuration
@@ -145,8 +148,9 @@ func (w *watcher) getConfig() map[string]map[string]RepoConfig {
 		repoConfigs := map[string]RepoConfig{}
 		for _, repo := range org.Repos {
 			repoConfigs[repo.Name] = RepoConfig{
-				Trigger:  repo.Mode.Trigger,
-				Branches: repo.Branches,
+				Trigger:        repo.Mode.Trigger,
+				RequiredLabels: repo.Mode.RequiredLabels,
+				Branches:       repo.Branches,
 			}
 		}
 		ret[org.Org] = repoConfigs

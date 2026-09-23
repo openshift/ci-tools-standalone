@@ -209,3 +209,22 @@ To enroll repository with the pipeline controller, you need to add it to the app
 
 Repository needs to be added to the main pipeline controller configuration file. Contact your platform team or CI/CD administrators to have your repository added with the desired mode (`manual` or `auto`).
 
+
+### Incident-only required labels
+
+An automatic-mode repository can temporarily require labels before the controller
+schedules its existing second-stage tests:
+
+```yaml
+mode:
+  trigger: auto
+  required_labels:
+  - acknowledge-critical-fixes-only
+```
+
+With `required_labels` absent, automatic scheduling is unchanged. With it
+present, the controller schedules second-stage tests only after every listed
+label is on the PR. Adding the final required label after the first stage has
+passed immediately evaluates and schedules the existing second stage. This
+setting does not create a ProwJob or affect direct, periodic, or postsubmit
+jobs.

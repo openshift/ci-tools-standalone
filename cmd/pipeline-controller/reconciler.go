@@ -242,6 +242,23 @@ func (r *reconciler) reconcile(ctx context.Context, req reconcile.Request) error
 		return nil
 	}
 
+	labelsPresent, err := requiredLabelsPresent(r.ghc, pj.Spec.Refs, repoConfig.RequiredLabels)
+	if err != nil {
+		if r.logger != nil {
+			r.logger.WithError(err).WithField("prowjob", pj.Name).Debug("Failed to evaluate required labels, skipping")
+		}
+		return nil
+	}
+	if !labelsPresent {
+		if r.logger != nil {
+			r.logger.WithFields(logrus.Fields{
+				"prowjob":         pj.Name,
+				"required_labels": repoConfig.RequiredLabels,
+			}).Debug("Required labels are absent, skipping second-stage scheduling")
+		}
+		return nil
+	}
+
 	status, err := r.reportSuccessOnPR(ctx, &pj, presubmits)
 	if err != nil || !status {
 		return err

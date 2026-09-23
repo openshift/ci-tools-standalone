@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
+	"sigs.k8s.io/prow/pkg/config"
 	"sigs.k8s.io/prow/pkg/config/secret"
 	prowflagutil "sigs.k8s.io/prow/pkg/flagutil"
 	configflagutil "sigs.k8s.io/prow/pkg/flagutil/config"
@@ -268,6 +269,86 @@ func (cw *clientWrapper) handlePullRequestCreation(l *logrus.Entry, event github
 	}
 }
 
+func (cw *clientWrapper) handleRequiredLabelAddition(logger *logrus.Entry, event github.PullRequestEvent) bool {
+	if event.Action != github.PullRequestActionLabeled {
+		return false
+	}
+
+	org := event.Repo.Owner.Login
+	repo := event.Repo.Name
+	currentCfg := cw.watcher.getConfig()
+	repos, orgExists := currentCfg[org]
+	repoConfig, repoExists := repos[repo]
+	if !orgExists || !repoExists || repoConfig.Trigger != "auto" || !isBranchEnabled(repoConfig.Branches, event.PullRequest.Base.Ref) {
+		return false
+	}
+
+	presubmits := cw.configDataProvider.GetPresubmits(org + "/" + repo)
+
+	labelIsRequired := false
+	for _, label := range repoConfig.RequiredLabels {
+		if label == event.Label.Name {
+			labelIsRequired = true
+			break
+		}
+	}
+	if !labelIsRequired {
+		for _, group := range [][]config.Presubmit{presubmits.protected, presubmits.pipelineConditionallyRequired, presubmits.pipelineSkipOnlyRequired} {
+			for _, presubmit := range group {
+				for _, label := range pipelineRequiredLabels(presubmit) {
+					if label == event.Label.Name {
+						labelIsRequired = true
+						break
+					}
+				}
+				if labelIsRequired {
+					break
+				}
+			}
+			if labelIsRequired {
+				break
+			}
+		}
+	}
+	if !labelIsRequired {
+		return false
+	}
+
+	prowJob := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: &v1.Refs{
+		Org:     org,
+		Repo:    repo,
+		BaseRef: event.PullRequest.Base.Ref,
+		Pulls: []v1.Pull{{
+			Number: event.PullRequest.Number,
+			SHA:    event.PullRequest.Head.SHA,
+		}},
+	}}}
+	labelsPresent, err := requiredLabelsPresent(cw.ghc, prowJob.Spec.Refs, repoConfig.RequiredLabels)
+	if err != nil || !labelsPresent {
+		if err != nil {
+			logger.WithError(err).Debug("Failed to evaluate required labels")
+		}
+		return true
+	}
+
+	complete, err := checkFirstStageComplete(context.Background(), cw.pjLister, prowJob, presubmits)
+	if err != nil || !complete {
+		if err != nil {
+			logger.WithError(err).Debug("Failed to check first-stage status")
+		}
+		return true
+	}
+
+	key := composeKey(prowJob.Spec.Refs)
+	if _, loaded := cw.ids.LoadOrStore(key, time.Now()); loaded {
+		return true
+	}
+	if err := sendComment(presubmits, prowJob, cw.ghc, func() { cw.ids.Delete(key) }, cw.pjLister); err != nil {
+		logger.WithError(err).Error("Failed to schedule second-stage tests after required label addition")
+	}
+	return true
+}
+
 func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullRequestEvent) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
@@ -282,6 +363,10 @@ func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullR
 	})
 
 	logger.Info("Processing label addition event")
+
+	if cw.handleRequiredLabelAddition(logger, event) {
+		return
+	}
 
 	if github.PullRequestActionLabeled == event.Action && event.Label.Name == labels.LGTM {
 		org := event.Repo.Owner.Login
