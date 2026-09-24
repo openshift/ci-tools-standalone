@@ -2,7 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -445,5 +452,111 @@ func TestOverflowRetirementSurvivesInFlightFirstPost(t *testing.T) {
 	state, _ = store.Read(ctx)
 	if state.Groups[g.GroupKey].MemberList != nil || state.Outbox["member-list:members"] != nil {
 		t.Fatalf("retirement update did not finish: group=%#v outbox=%#v", state.Groups[g.GroupKey], state.Outbox)
+	}
+}
+
+// TestSlackHTTPClientRequestEncoding pins the wire contract of every SlackAPI method.
+// users.lookupByEmail reads only form-encoded parameters and answers invalid_arguments for a
+// JSON body, which silently emptied the privileged-user cache and failed authorization closed
+// for everyone. The per-method content type is therefore asserted, not just the happy path.
+func TestSlackHTTPClientRequestEncoding(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("xoxb-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	type capture struct {
+		contentType, auth, body string
+	}
+	var got map[string]capture
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		got[strings.TrimPrefix(r.URL.Path, "/")] = capture{
+			contentType: r.Header.Get("Content-Type"),
+			auth:        r.Header.Get("Authorization"),
+			body:        string(body),
+		}
+		fmt.Fprint(w, `{"ok":true,"ts":"1.1","message":{"ts":"1.1"},"user":{"id":"U1"}}`)
+	}))
+	defer server.Close()
+
+	const (
+		jsonType = "application/json; charset=utf-8"
+		formType = "application/x-www-form-urlencoded"
+	)
+	for _, testCase := range []struct {
+		name, method, wantType, wantBody string
+		invoke                           func(*SlackHTTPClient) error
+	}{
+		{
+			name: "lookup user by email is form encoded", method: "users.lookupByEmail",
+			wantType: formType, wantBody: "email=someone%40redhat.com",
+			invoke: func(c *SlackHTTPClient) error {
+				id, err := c.LookupUserByEmail(context.Background(), "someone@redhat.com")
+				if err == nil && id != "U1" {
+					return fmt.Errorf("id=%q, want U1", id)
+				}
+				return err
+			},
+		},
+		{
+			name: "post message is json", method: "chat.postMessage", wantType: jsonType,
+			invoke: func(c *SlackHTTPClient) error {
+				_, err := c.PostMessage(context.Background(), OutboxTarget{Channel: "C1"}, SlackPayload{Text: "hi"})
+				return err
+			},
+		},
+		{
+			name: "update message is json", method: "chat.update", wantType: jsonType,
+			invoke: func(c *SlackHTTPClient) error {
+				return c.UpdateMessage(context.Background(), OutboxTarget{Channel: "C1", MessageTS: "1.1"}, SlackPayload{Text: "hi"})
+			},
+		},
+		{
+			name: "post ephemeral is json", method: "chat.postEphemeral", wantType: jsonType,
+			invoke: func(c *SlackHTTPClient) error {
+				return c.PostEphemeral(context.Background(), "C1", "U1", "hi")
+			},
+		},
+		{
+			name: "open view is json", method: "views.open", wantType: jsonType,
+			invoke: func(c *SlackHTTPClient) error {
+				return c.OpenView(context.Background(), "trigger", map[string]any{"type": "modal"})
+			},
+		},
+		{
+			name: "add reaction is json", method: "reactions.add", wantType: jsonType,
+			invoke: func(c *SlackHTTPClient) error {
+				return c.AddReaction(context.Background(), "C1", "1.1", "eyes")
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got = map[string]capture{}
+			client := &SlackHTTPClient{TokenPath: tokenPath, BaseURL: server.URL, Client: server.Client()}
+			if err := testCase.invoke(client); err != nil {
+				t.Fatalf("invoke: %v", err)
+			}
+			call, ok := got[testCase.method]
+			if !ok {
+				t.Fatalf("no request to %s, saw %v", testCase.method, got)
+			}
+			if call.contentType != testCase.wantType {
+				t.Errorf("Content-Type=%q, want %q", call.contentType, testCase.wantType)
+			}
+			if call.auth != "Bearer xoxb-token" {
+				t.Errorf("Authorization=%q, want %q", call.auth, "Bearer xoxb-token")
+			}
+			if testCase.wantBody != "" && call.body != testCase.wantBody {
+				t.Errorf("body=%q, want %q", call.body, testCase.wantBody)
+			}
+			if testCase.wantType == jsonType && !json.Valid([]byte(call.body)) {
+				t.Errorf("body is not valid JSON: %q", call.body)
+			}
+		})
 	}
 }

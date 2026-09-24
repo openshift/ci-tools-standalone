@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -42,13 +43,24 @@ type SlackError struct{ Code string }
 func (e *SlackError) Error() string { return "slack API: " + e.Code }
 
 func (s *SlackHTTPClient) call(ctx context.Context, method string, payload any, out *slackResponse) error {
-	token, err := readSecret(s.TokenPath)
-	if err != nil {
-		return fmt.Errorf("read Slack token: %w", err)
-	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
+	}
+	return s.do(ctx, method, "application/json; charset=utf-8", raw, out)
+}
+
+// callForm sends application/x-www-form-urlencoded. Most Slack Web API methods accept a JSON
+// body, but a few read only form-encoded parameters and answer invalid_arguments for JSON, so
+// those must not go through call.
+func (s *SlackHTTPClient) callForm(ctx context.Context, method string, values url.Values, out *slackResponse) error {
+	return s.do(ctx, method, "application/x-www-form-urlencoded", []byte(values.Encode()), out)
+}
+
+func (s *SlackHTTPClient) do(ctx context.Context, method, contentType string, raw []byte, out *slackResponse) error {
+	token, err := readSecret(s.TokenPath)
+	if err != nil {
+		return fmt.Errorf("read Slack token: %w", err)
 	}
 	base := s.BaseURL
 	if base == "" {
@@ -63,7 +75,7 @@ func (s *SlackHTTPClient) call(ctx context.Context, method string, payload any, 
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+string(token))
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Content-Type", contentType)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -104,7 +116,7 @@ func (s *SlackHTTPClient) AddReaction(ctx context.Context, channel, ts, name str
 }
 func (s *SlackHTTPClient) LookupUserByEmail(ctx context.Context, email string) (string, error) {
 	var out slackResponse
-	err := s.call(ctx, "users.lookupByEmail", map[string]any{"email": email}, &out)
+	err := s.callForm(ctx, "users.lookupByEmail", url.Values{"email": {email}}, &out)
 	return out.User.ID, err
 }
 
