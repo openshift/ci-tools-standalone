@@ -32,11 +32,13 @@ type fakeSlack struct {
 	emptyPostTS                     bool
 	onPost                          func()
 	users                           map[string]string
+	posted, updated                 []SlackPayload
 }
 
-func (f *fakeSlack) PostMessage(context.Context, OutboxTarget, SlackPayload) (string, error) {
+func (f *fakeSlack) PostMessage(_ context.Context, _ OutboxTarget, p SlackPayload) (string, error) {
 	f.mu.Lock()
 	f.posts++
+	f.posted = append(f.posted, p)
 	fn := f.onPost
 	err := f.postErr
 	ts := f.postTS
@@ -49,10 +51,11 @@ func (f *fakeSlack) PostMessage(context.Context, OutboxTarget, SlackPayload) (st
 	}
 	return ts, err
 }
-func (f *fakeSlack) UpdateMessage(context.Context, OutboxTarget, SlackPayload) error {
+func (f *fakeSlack) UpdateMessage(_ context.Context, _ OutboxTarget, p SlackPayload) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updates++
+	f.updated = append(f.updated, p)
 	return f.updateErr
 }
 func (f *fakeSlack) PostEphemeral(context.Context, string, string, string) error { return nil }

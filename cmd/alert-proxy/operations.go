@@ -701,7 +701,8 @@ func (w *OperationWorker) complete(ctx context.Context, id string, op *SilenceOp
 				case "active":
 					g.ScheduledSilence = nil
 					g.Status = "silenced"
-					closeEpisode(s, g, x.CompletedAt, "silenced", w.renderer.RenderSilencedParent(g, op.Actor, canonical.Matchers, canonical.EndsAt), w.renderer.RenderSilenceAudit(message, shortID, w.enabled()))
+					audit := w.renderer.RenderSilenceAudit(message, shortID, w.enabled())
+					closeEpisode(s, g, x.CompletedAt, "silenced", w.renderer.RenderSilencedParent(g, op.Actor, canonical.Matchers, canonical.EndsAt), &audit)
 					ref.AuditPostID = "close-reply:" + g.EpisodeID
 					auditedByClose = true
 				case "pending":
@@ -1013,7 +1014,8 @@ func (w *OperationWorker) refreshOwned(ctx context.Context, silences []AMSilence
 					g.ScheduledSilence = nil
 					message := fmt.Sprintf("<@%s> created an Alertmanager silence for `%s` until %s UTC. Canonical state: *active*. Reason: %s", slackEscape(ref.Actor), slackEscape(canonicalMatcherString(canonical.Matchers)), canonical.EndsAt.UTC().Format("2006-01-02 15:04"), slackEscape(ref.Reason))
 					g.Status = "silenced"
-					closeEpisode(s, g, now, "silenced", w.renderer.RenderSilencedParent(g, ref.Actor, canonical.Matchers, canonical.EndsAt), w.renderer.RenderEventReply(message))
+					reply := w.renderer.RenderEventReply(message)
+					closeEpisode(s, g, now, "silenced", w.renderer.RenderSilencedParent(g, ref.Actor, canonical.Matchers, canonical.EndsAt), &reply)
 				}
 			}
 		}

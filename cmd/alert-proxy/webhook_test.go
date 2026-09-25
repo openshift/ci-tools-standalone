@@ -71,6 +71,7 @@ func TestWebhookLifecycleAndPersistentDeduplication(t *testing.T) {
 		t.Fatalf("omitted firing member was falsely resolved: status=%s closed=%v", g.Status, g.ClosedAt)
 	}
 	now = now.Add(time.Minute)
+	parentPostID := state.Groups[g.GroupKey].Parent.PostID
 	resolvedA := webhookBody(t, "resolved", alertPayload("a", "resolved", now.Add(-time.Hour)))
 	if _, err := processor.Process(ctx, "app-ci-uwm", resolvedA); err != nil {
 		t.Fatal(err)
@@ -79,6 +80,17 @@ func TestWebhookLifecycleAndPersistentDeduplication(t *testing.T) {
 	oldEpisode := state.Groups[g.GroupKey].EpisodeID
 	if state.Groups[g.GroupKey].ClosedReason != "resolved" || state.Groups[g.GroupKey].Parent != nil {
 		t.Fatalf("explicit settlement did not detach resolved episode: %#v", state.Groups[g.GroupKey])
+	}
+	// Settling posts nothing of its own; the parent update carries the whole story.
+	if work, ok := state.Outbox["close-reply:"+oldEpisode]; ok {
+		t.Fatalf("settlement queued a separate resolved message: %#v", work)
+	}
+	closeParent := state.Outbox["parent:"+parentPostID]
+	if closeParent == nil || closeParent.ImmutablePayload == nil {
+		t.Fatalf("settlement did not pin a final parent payload: %#v", state.Outbox)
+	}
+	if text := closeParent.ImmutablePayload.Text; !strings.Contains(text, "may not mean the underlying problem is fixed") {
+		t.Fatalf("final parent omits the no-longer-firing caveat: %s", text)
 	}
 
 	now = now.Add(time.Minute)
@@ -267,5 +279,133 @@ func TestShrinkingBatchDurablyRetiresOverflowReply(t *testing.T) {
 	state, _ = store.Read(ctx)
 	if state.Groups[groupKey].MemberList != nil || state.Outbox[retirementID] != nil {
 		t.Fatalf("retired overflow remained tracked: group=%#v outbox=%#v", state.Groups[groupKey], state.Outbox)
+	}
+}
+
+// Settling an episode must cost the channel exactly one edit to the card that
+// already reported the alert: no second post, no leftover work, and the caveat
+// on the card so nobody reads the edit as "fixed". Both the already-posted and
+// the still-in-flight parent have to land there.
+func TestSettlementEditsTheReportingCardAndPostsNothingElse(t *testing.T) {
+	groupKey := "{}:{alertname=\"Example\",job=\"ci\"}"
+	for _, tc := range []struct {
+		name              string
+		resolveDuringPost bool
+	}{
+		{name: "parent already posted"},
+		{name: "parent still in flight", resolveDuringPost: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := NewMemoryStateStore()
+			now := time.Unix(30_000, 0).UTC()
+			processor := &WebhookProcessor{store: store, channel: "C1", deliveryTTL: 8 * time.Minute, requestTTL: time.Hour, auditTTL: time.Hour, now: func() time.Time { return now }, renderer: testRenderer()}
+			resolve := func() {
+				now = now.Add(time.Minute)
+				if _, err := processor.Process(ctx, alertmanagerSource, webhookBody(t, "resolved", alertPayload("a", "resolved", now.Add(-time.Hour)))); err != nil {
+					t.Error(err)
+				}
+			}
+			slack := &fakeSlack{postTS: "555.1"}
+			if tc.resolveDuringPost {
+				slack.onPost = resolve
+			}
+			worker := NewOutboxWorker(store, slack, testRenderer(), nil)
+
+			if _, err := processor.Process(ctx, alertmanagerSource, webhookBody(t, "firing", alertPayload("a", "firing", now.Add(-time.Hour)))); err != nil {
+				t.Fatal(err)
+			}
+			if did, err := worker.ProcessNext(ctx); err != nil || !did {
+				t.Fatalf("parent post did=%v err=%v", did, err)
+			}
+			if !tc.resolveDuringPost {
+				resolve()
+			}
+			for i := 0; ; i++ {
+				did, err := worker.ProcessNext(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !did {
+					break
+				}
+				if i > 4 {
+					t.Fatal("settlement never drained the outbox")
+				}
+			}
+
+			state, _ := store.Read(ctx)
+			if len(state.Outbox) != 0 {
+				t.Fatalf("settlement left work behind: %#v", state.Outbox)
+			}
+			if state.Groups[groupKey].ClosedReason != "resolved" {
+				t.Fatalf("episode did not settle: %#v", state.Groups[groupKey])
+			}
+			slack.mu.Lock()
+			defer slack.mu.Unlock()
+			if slack.posts != 1 || slack.updates != 1 {
+				t.Fatalf("settlement cost %d posts and %d updates, want 1 and 1", slack.posts, slack.updates)
+			}
+			if !strings.Contains(slack.updated[0].Text, "may not mean the underlying problem is fixed") {
+				t.Fatalf("the settling edit omits the no-longer-firing caveat: %q", slack.updated[0].Text)
+			}
+		})
+	}
+}
+
+// A silence or drain close still needs its own reply: it carries the audit
+// controls, and operations.go addresses that post by "close-reply:"+EpisodeID.
+// Whether or not a reply is queued, the parent update is what actually tells
+// #ops-testplatform the episode is over, so it has to be pinned either way.
+func TestCloseEpisodeRepliesOnlyWhenGivenOne(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		messageTS string
+	}{
+		{name: "parent already posted", messageTS: "1"},
+		{name: "parent still in flight", messageTS: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, reply := range []struct {
+				name    string
+				payload *SlackPayload
+				want    bool
+			}{
+				{name: "silenced", payload: &SlackPayload{Text: "silenced by UADMIN"}, want: true},
+				{name: "resolved", payload: nil, want: false},
+			} {
+				t.Run(reply.name, func(t *testing.T) {
+					g := openTestGroup()
+					g.Parent.MessageTS = tc.messageTS
+					postID := g.Parent.PostID
+					s := &State{Groups: map[string]*GroupState{"g": g}, Outbox: map[string]*OutboxWork{
+						"parent:" + postID: {GroupKey: "g", Object: "parent", Kind: "post", DesiredRevision: 1},
+					}}
+					closeEpisode(s, g, time.Now(), "x", SlackPayload{Text: "final"}, reply.payload)
+					if _, ok := s.Outbox["close-reply:e"]; ok != reply.want {
+						t.Fatalf("close reply queued=%v want=%v", ok, reply.want)
+					}
+					if reply.want {
+						if queued := s.Outbox["close-reply:e"]; queued.ImmutablePayload == nil || queued.ImmutablePayload.Text != "silenced by UADMIN" {
+							t.Fatalf("close reply lost its payload: %#v", queued)
+						}
+					}
+					// The final parent render is the only signal the card itself
+					// carries; without it a closed episode reads [FIRING] forever.
+					parent := s.Outbox["close-parent:e"]
+					if tc.messageTS == "" {
+						if _, ok := s.Outbox["close-parent:e"]; ok {
+							t.Fatalf("in-flight parent was re-targeted as an update: %#v", s.Outbox["close-parent:e"])
+						}
+						parent = s.Outbox["parent:"+postID]
+					} else if _, ok := s.Outbox["parent:"+postID]; ok {
+						t.Fatalf("superseded parent work was not withdrawn: %#v", s.Outbox["parent:"+postID])
+					}
+					if parent == nil || parent.ImmutablePayload == nil || parent.ImmutablePayload.Text != "final" {
+						t.Fatalf("close did not pin the final parent payload: %#v", parent)
+					}
+				})
+			}
+		})
 	}
 }

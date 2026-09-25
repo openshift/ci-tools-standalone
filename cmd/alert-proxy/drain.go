@@ -49,7 +49,8 @@ func (s *LifecycleSweeper) Sweep(ctx context.Context) error {
 				g.Status = "stale"
 				final := *g
 				final.ClosedReason = "stale"
-				closeEpisode(state, g, now, "stale", s.renderer.RenderParent(&final, false), s.renderer.RenderEventReply("This Alertmanager notification group is no longer tracked; no explicit resolution was inferred."))
+				reply := s.renderer.RenderEventReply("This Alertmanager notification group is no longer tracked; no explicit resolution was inferred.")
+				closeEpisode(state, g, now, "stale", s.renderer.RenderParent(&final, false), &reply)
 				changed = true
 				continue
 			}
@@ -126,7 +127,8 @@ func (d *DrainController) Begin(ctx context.Context) error {
 				g.Status = "stale"
 				final := *g
 				final.ClosedReason = "stale"
-				closeEpisode(s, g, now, "stale", d.renderer.RenderParent(&final, false), d.renderer.RenderEventReply("alert-proxy is draining for rollback; controls have been disabled."))
+				reply := d.renderer.RenderEventReply("alert-proxy is draining for rollback; controls have been disabled.")
+				closeEpisode(s, g, now, "stale", d.renderer.RenderParent(&final, false), &reply)
 			}
 		}
 		for ownership, ref := range s.SilenceRefs {

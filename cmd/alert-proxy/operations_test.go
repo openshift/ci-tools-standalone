@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -386,6 +387,44 @@ func TestPendingReadbackDoesNotCloseUntilObservedActive(t *testing.T) {
 	state, _ = store.Read(ctx)
 	if state.Groups["g"].ClosedReason != "silenced" || state.Groups["g"].Parent != nil {
 		t.Fatal("active observation did not close and detach episode")
+	}
+}
+
+// The close reply is the only carrier of the Extend and Unsilence controls, and
+// finalizeSilenceAuditForRef reaches it by ref.AuditPostID. If the close were to
+// stop queuing that reply the loss would be silent: the finalizer falls through to
+// a control-free audit note, so nothing looks broken while the buttons never existed.
+func TestGroupSilenceClosesEpisodeWithDurableUnsilenceControls(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStateStore()
+	api := newFakeAM()
+	api.alerts = []AMAlert{activeAlert(map[string]string{"alertname": "Broken", "namespace": "ci"})}
+	g := openTestGroup()
+	g.Source = "app-ci-uwm"
+	g.Parent.MessageTS = "1"
+	_ = store.Update(ctx, func(s *State) error { s.Groups["g"] = g; return nil })
+	worker := newTestOperationWorker(store, api, true)
+	id, err := worker.Prepare(ctx, PrepareSilenceRequest{Source: "app-ci-uwm", Matchers: validMatchers(), EndsAt: time.Now().Add(4 * time.Hour), Actor: "UADMIN", Reason: "repair", Origin: &SilenceOrigin{GroupKey: "g", EpisodeID: "e"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if did, err := worker.ProcessNext(ctx); err != nil || !did {
+		t.Fatalf("did=%v err=%v", did, err)
+	}
+	state, _ := store.Read(ctx)
+	if state.Groups["g"].ClosedReason != "silenced" {
+		t.Fatalf("active silence did not close its originating episode: %#v", state.Groups["g"])
+	}
+	ref := state.SilenceRefs[state.SilenceOperations[id].OwnershipID]
+	if ref == nil || ref.AuditPostID != "close-reply:"+g.EpisodeID {
+		t.Fatalf("silence audit was not correlated to the close reply: %#v", ref)
+	}
+	audit := state.Outbox[ref.AuditPostID]
+	if audit == nil || audit.ImmutablePayload == nil {
+		t.Fatalf("close did not queue the silence audit reply: outbox=%#v", state.Outbox)
+	}
+	if !strings.Contains(string(audit.ImmutablePayload.Blocks), "alert-proxy:unsilence:") {
+		t.Fatalf("silence audit reply carries no Unsilence control: %s", audit.ImmutablePayload.Blocks)
 	}
 }
 

@@ -49,6 +49,36 @@ func TestLifecycleStalenessNeverClaimsResolution(t *testing.T) {
 	if state.Groups["g"].ClosedReason != "stale" || state.Groups["g"].ClosedReason == "resolved" {
 		t.Fatalf("stale group state=%#v", state.Groups["g"])
 	}
+	// Nothing on the parent card explains why tracking stopped, so the thread
+	// reply is the only place the channel learns no resolution was inferred.
+	reply := state.Outbox["close-reply:"+g.EpisodeID]
+	if reply == nil || reply.ImmutablePayload == nil || !strings.Contains(reply.ImmutablePayload.Text, "no explicit resolution was inferred") {
+		t.Fatalf("staleness close did not explain itself in the thread: %#v", reply)
+	}
+}
+
+func TestDrainExplainsDisabledControlsInEachOpenEpisodeThread(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStateStore()
+	now := time.Now().UTC()
+	g := openTestGroup()
+	g.Parent.MessageTS = "1"
+	_ = store.Update(ctx, func(s *State) error { s.Groups["g"] = g; return nil })
+	api := newFakeAM()
+	drain := &DrainController{store: store, api: api, operations: newTestOperationWorker(store, api, true), outbox: NewOutboxWorker(store, &fakeSlack{}, testRenderer(), nil), renderer: testRenderer(), now: func() time.Time { return now }}
+	if err := drain.Begin(ctx); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Read(ctx)
+	if state.Groups["g"].ClosedReason != "stale" {
+		t.Fatalf("drain left an open episode: %#v", state.Groups["g"])
+	}
+	// A rollback silently retires every control on the card. The reply is the
+	// only notice operators get that the buttons have stopped working.
+	reply := state.Outbox["close-reply:"+g.EpisodeID]
+	if reply == nil || reply.ImmutablePayload == nil || !strings.Contains(reply.ImmutablePayload.Text, "controls have been disabled") {
+		t.Fatalf("drain close did not announce disabled controls: %#v", reply)
+	}
 }
 
 func TestEscalationLatchedOnce(t *testing.T) {

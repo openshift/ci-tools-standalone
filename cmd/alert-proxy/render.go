@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -11,6 +12,14 @@ import (
 const (
 	maxRenderedMembers  = 10
 	maxMemberListBlocks = 50
+	// Alertmanager only tells us an alert stopped firing, never why. Several CI rules
+	// are rate-over-a-window detectors that stop firing once the failure ages out of
+	// the window while the job stays red, so claiming "resolved" here is wrong as
+	// often as it is right. Say only what the notification actually carries.
+	noLongerFiringStatus = "NO LONGER FIRING IN ALERTMANAGER"
+	// Carried on the parent card rather than in a reply of its own. A settled episode
+	// is not news; it is a state change to the message that already reported the alert.
+	noLongerFiringCaveat = ":heavy_minus_sign: Alertmanager stopped reporting this notification group as firing. Depending on the rule, that may not mean the underlying problem is fixed."
 )
 
 type Renderer struct {
@@ -21,19 +30,25 @@ type Renderer struct {
 
 func (r *Renderer) RenderParent(g *GroupState, controls bool) SlackPayload {
 	status := strings.ToUpper(g.Status)
+	if status == "RESOLVED" {
+		status = noLongerFiringStatus
+	}
 	switch g.ClosedReason {
 	case "silenced":
 		status = "SILENCED IN ALERTMANAGER"
 	case "stale":
 		status = "NO LONGER TRACKED"
 	case "resolved":
-		status = "RESOLVED"
+		status = noLongerFiringStatus
 	}
 	header := fmt.Sprintf("*[%s] %s*", status, renderLabels(g.GroupLabels))
 	meta := fmt.Sprintf("%d alerts in this notification · firing for %s · notification %d · last seen %s UTC", len(g.LatestBatch), humanDuration(g.LastSeen.Sub(g.EpisodeStartedAt)), g.NotificationCount, g.LastSeen.UTC().Format("2006-01-02 15:04"))
 	if isProbeGroup(g) {
 		probeText := fmt.Sprintf("Alert proxy end-to-end probe · status %s · delivery %d · %s UTC", strings.ToLower(status), g.NotificationCount, g.LastSeen.UTC().Format("2006-01-02 15:04"))
 		return payload(probeText, []any{map[string]any{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": probeText}}})
+	}
+	if status == noLongerFiringStatus {
+		meta += "\n" + noLongerFiringCaveat
 	}
 	if g.Ack != nil {
 		meta += fmt.Sprintf("\nAcknowledged by <@%s> at %s UTC", slackEscape(g.Ack.Actor), g.Ack.At.UTC().Format("2006-01-02 15:04"))
@@ -172,13 +187,15 @@ func payload(text string, blocks []any) SlackPayload {
 func renderAlert(a AlertSnapshot) string {
 	name := alertDisplayName(a)
 	icon := ":red_circle:"
+	state := a.Status
 	if a.Status == "resolved" {
-		icon = ":white_check_mark:"
+		icon = ":heavy_minus_sign:"
+		state = "no longer firing"
 	}
 	detail := firstNonEmpty(a.Annotations["message"], a.Annotations["summary"], a.Annotations["description"])
-	line := fmt.Sprintf("%s *%s* — `%s`", icon, slackEscape(name), a.Status)
+	line := fmt.Sprintf("%s *%s* — `%s`", icon, slackEscape(name), state)
 	if detail != "" {
-		line += "\n" + slackEscape(detail)
+		line += "\n" + slackAnnotationText(detail)
 	}
 	if a.GeneratorURL != "" {
 		line += fmt.Sprintf(" · <%s|source>", slackURL(a.GeneratorURL))
@@ -288,8 +305,37 @@ func slackEscape(s string) string {
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	return strings.ReplaceAll(s, ">", "&gt;")
 }
+
+// slackLinkPattern matches only the <url> and <url|label> forms. The URL cannot
+// contain a delimiter and the label cannot contain angle brackets, so a matched
+// span can never carry a nested broadcast like <!channel>.
+var slackLinkPattern = regexp.MustCompile(`<(https?://[^<>|]*)(\|[^<>]*)?>`)
+
+// slackAnnotationText escapes annotation text but leaves <url|label> links intact.
+// Alert annotations in openshift/release are authored as Slack mrkdwn because
+// slack_configs passed {{ .CommonAnnotations.message }} through verbatim, and
+// slack-warnings still delivers the same text that way. Escaping the links here
+// printed the raw markup. Everything outside a link is still escaped, so the
+// <!channel>, <!here>, and <@U…> broadcast forms cannot reach Slack.
+func slackAnnotationText(s string) string {
+	var b strings.Builder
+	last := 0
+	for _, m := range slackLinkPattern.FindAllStringIndex(s, -1) {
+		b.WriteString(slackEscape(s[last:m[0]]))
+		b.WriteString(s[m[0]:m[1]])
+		last = m[1]
+	}
+	b.WriteString(slackEscape(s[last:]))
+	return b.String()
+}
+
+// slackURLEscaper encodes every character that can end or re-target a link span.
+// "<" matters as much as ">": leaving it raw lets a URL smuggle a broadcast, as
+// in <https://x?<!channel|source>, which Slack reads as <!channel|source>.
+var slackURLEscaper = strings.NewReplacer("|", "%7C", "<", "%3C", ">", "%3E")
+
 func slackURL(s string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(s, "|", "%7C"), ">", "%3E")
+	return slackURLEscaper.Replace(s)
 }
 func plain(s string, max int) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "*", ""))

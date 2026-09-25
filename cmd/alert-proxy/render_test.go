@@ -69,3 +69,133 @@ func TestMemberListNeverExceedsSlackBlockLimit(t *testing.T) {
 		t.Fatalf("member list blocks=%d payload=%s", len(blocks), p.Blocks)
 	}
 }
+
+func TestResolvedGroupDoesNotClaimTheProblemIsFixed(t *testing.T) {
+	g := openTestGroup()
+	g.Status = "resolved"
+	g.LatestBatch = []AlertSnapshot{{Fingerprint: "a", Status: "resolved", Labels: map[string]string{"alertname": "plank-job-with-infra-internal-role-failures"}}}
+	rendered := string(testRenderer().RenderParent(g, false).Blocks)
+	if strings.Contains(rendered, "RESOLVED") || strings.Contains(rendered, "white_check_mark") {
+		t.Fatalf("rendered group claims resolution: %s", rendered)
+	}
+	if !strings.Contains(rendered, noLongerFiringStatus) || !strings.Contains(rendered, "no longer firing") {
+		t.Fatalf("rendered group omits the no-longer-firing wording: %s", rendered)
+	}
+
+	if !strings.Contains(rendered, noLongerFiringCaveat) {
+		t.Fatalf("rendered group omits the no-longer-firing caveat: %s", rendered)
+	}
+
+	// The outbox can re-render a group after closeEpisode has already detached it,
+	// so the ClosedReason path has to reach the same wording as the live one —
+	// caveat included, because that is all a settled episode ever says.
+	closed := openTestGroup()
+	closed.Status = "firing"
+	closed.ClosedReason = "resolved"
+	closedRender := string(testRenderer().RenderParent(closed, false).Blocks)
+	if !strings.Contains(closedRender, noLongerFiringStatus) || !strings.Contains(closedRender, noLongerFiringCaveat) {
+		t.Fatalf("closed-as-resolved group omits the no-longer-firing wording: %s", closedRender)
+	}
+
+	// Silences and staleness have their own explanation; the settlement caveat
+	// would be a claim about Alertmanager that those closes never made.
+	for _, reason := range []string{"silenced", "stale"} {
+		other := openTestGroup()
+		other.Status = "firing"
+		other.ClosedReason = reason
+		if rendered := string(testRenderer().RenderParent(other, false).Blocks); strings.Contains(rendered, noLongerFiringCaveat) {
+			t.Fatalf("%s close carried the settlement caveat: %s", reason, rendered)
+		}
+	}
+}
+
+func TestRenderedAlertKeepsAnnotationLinks(t *testing.T) {
+	got := renderAlert(AlertSnapshot{
+		Fingerprint:  "a",
+		Status:       "firing",
+		Labels:       map[string]string{"alertname": "plank-job-with-infra-internal-role-failures"},
+		Annotations:  map[string]string{"message": "Check on <https://deck-internal-ci.apps.ci/?job=x|deck-internal>. <!channel>"},
+		GeneratorURL: "https://prometheus.example/graph?g0.expr=up<!channel",
+	})
+	want := ":red_circle: *plank-job-with-infra-internal-role-failures* — `firing`\n" +
+		"Check on <https://deck-internal-ci.apps.ci/?job=x|deck-internal>. &lt;!channel&gt;" +
+		" · <https://prometheus.example/graph?g0.expr=up%3C!channel|source>"
+	if got != want {
+		t.Fatalf("got  %q\nwant %q", got, want)
+	}
+}
+
+func TestAnnotationLinksSurviveButBroadcastsDoNot(t *testing.T) {
+	for _, tc := range []struct {
+		name, in, want string
+	}{
+		{
+			name: "labelled link is passed through verbatim",
+			in:   "Check on <https://deck-internal-ci.apps.ci/?job=x|deck-internal>.",
+			want: "Check on <https://deck-internal-ci.apps.ci/?job=x|deck-internal>.",
+		},
+		{
+			name: "bare link is passed through verbatim",
+			in:   "See <https://example.com/a?b=1&c=2>",
+			want: "See <https://example.com/a?b=1&c=2>",
+		},
+		{
+			name: "channel broadcast is escaped",
+			in:   "<!channel> everyone look",
+			want: "&lt;!channel&gt; everyone look",
+		},
+		{
+			name: "user mention is escaped",
+			in:   "ping <@U12345>",
+			want: "ping &lt;@U12345&gt;",
+		},
+		{
+			name: "text around a link is still escaped",
+			in:   "a < b & <https://example.com|x> c > d",
+			want: "a &lt; b &amp; <https://example.com|x> c &gt; d",
+		},
+		{
+			// The label pattern rejects angle brackets, so nothing matches and the
+			// whole span is escaped rather than passed through as a link.
+			name: "a broadcast cannot hide in a link label",
+			in:   "<https://example.com|<!channel>>",
+			want: "&lt;https://example.com|&lt;!channel&gt;&gt;",
+		},
+		{
+			name: "a broadcast cannot hide in a link URL",
+			in:   "<https://<!channel>|z>",
+			want: "&lt;https://&lt;!channel&gt;|z&gt;",
+		},
+		{
+			name: "a broadcast abutting a link is escaped",
+			in:   "<https://example.com|x><!channel>",
+			want: "<https://example.com|x>&lt;!channel&gt;",
+		},
+		{
+			name: "a broadcast prefixing a link is escaped",
+			in:   "<<!channel>https://example.com>",
+			want: "&lt;&lt;!channel&gt;https://example.com&gt;",
+		},
+		{
+			name: "subteam broadcast is escaped",
+			in:   "<!subteam^S0|@team>",
+			want: "&lt;!subteam^S0|@team&gt;",
+		},
+		{
+			name: "channel reference is escaped",
+			in:   "<#C1|general>",
+			want: "&lt;#C1|general&gt;",
+		},
+		{
+			name: "a non-http scheme is escaped",
+			in:   "<javascript:alert(1)|x>",
+			want: "&lt;javascript:alert(1)|x&gt;",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := slackAnnotationText(tc.in); got != tc.want {
+				t.Fatalf("got  %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
