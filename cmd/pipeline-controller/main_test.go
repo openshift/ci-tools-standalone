@@ -47,6 +47,17 @@ func TestPullRequestNotificationIsUniversal(t *testing.T) {
 				if len(f.gh.comments) != 1 || f.gh.comments[0].Body != pullRequestInfoComment || f.gh.statusWrites != 0 || f.jobs.creates != 0 {
 					t.Fatal("opening event did not post only the universal notification")
 				}
+				if !strings.Contains(f.gh.comments[0].Body, "The repository's configured pipeline mode") ||
+					!strings.Contains(f.gh.comments[0].Body, "Pipeline Controller User Guide") ||
+					!strings.Contains(f.gh.comments[0].Body, "An authorized repository approver can waive") ||
+					!strings.Contains(f.gh.comments[0].Body, "`/override <status-context>`") {
+					t.Fatal("opening notification omitted generic mode or override instructions")
+				}
+				for _, line := range strings.Split(f.gh.comments[0].Body, "\n") {
+					if strings.HasPrefix(line, "/test ") || strings.HasPrefix(line, "/override ") {
+						t.Fatal("opening notification contains an executable command")
+					}
+				}
 				if selection == "normal" && f.gh.getPullRequestCalls != 0 {
 					t.Fatal("normal-only notification acquired an extra GitHub lookup")
 				}

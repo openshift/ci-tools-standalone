@@ -30,7 +30,7 @@ import (
 	"sigs.k8s.io/prow/pkg/logrusutil"
 )
 
-const pullRequestInfoComment = "**Pipeline controller notification**\n\nThis PR uses the [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) for second-stage tests. Selection and triggering follow the repository configuration.\n\nUse `/test ?` to list jobs, `/pipeline remaining` to request missing second-stage tests, or `/pipeline required` to rerun the selected second-stage set."
+const pullRequestInfoComment = "**Pipeline controller notification**\n\nThis PR uses the [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) for second-stage tests. Selection and triggering follow the repository configuration.\n\nUse `/test ?` to list jobs and `/test <job-name>` to run a specific job. Use `/pipeline remaining` to request missing second-stage tests or `/pipeline required` to rerun the selected second-stage set. Pipeline commands may request multiple jobs. The repository's configured pipeline mode determines whether second-stage tests run automatically, after an approval label, or only when requested. See the [Pipeline Controller User Guide](https://github.com/openshift/ci-tools-standalone/blob/main/cmd/pipeline-controller/documentation.md) for details.\n\nAn authorized repository approver can waive a required test and allow merging without running it by commenting `/override <status-context>`. Use the full status context shown in the PR checks. See [override permissions and guidance](https://docs.ci.openshift.org/how-tos/overriding-failing-ci-jobs/)."
 
 const RepoNotConfiguredMessage = "This repository is not currently configured for [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) support."
 

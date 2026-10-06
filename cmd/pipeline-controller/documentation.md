@@ -63,6 +63,20 @@ In **LGTM Mode**, the pipeline controller triggers second-stage tests when the `
 
 **Important Note:** If you manually trigger some second-stage tests before the `lgtm` label is added, the controller **complements** them when the label lands: it schedules only the remaining required jobs that do not yet have a run at the current HEAD (a "delta"), skipping the ones you already triggered. One manual trigger no longer moves the whole pipeline into manual control. To re-run a specific job that already ran, use `/test <job>`.
 
+## Authorized Overrides
+
+Required second-stage jobs normally need a successful result at the current
+pull request commit before the repository's merge controller can merge. An
+authorized repository approver may waive one required status with:
+
+```
+/override <status-context>
+```
+
+Use the full status context shown in the pull request checks. This is a Prow
+authorization action; it does not change the pipeline mode or schedule a job.
+See the [Prow override guidance](https://docs.ci.openshift.org/how-tos/overriding-failing-ci-jobs/).
+
 ## The `/pipeline required` Command
 
 The `/pipeline required` command works in **all three modes** and allows you to explicitly request that the pipeline controller trigger all required and necessary second-stage tests.
