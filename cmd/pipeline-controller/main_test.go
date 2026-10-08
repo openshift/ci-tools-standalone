@@ -34,17 +34,18 @@ func TestPullRequestNotificationIsUniversal(t *testing.T) {
 		for _, selection := range []string{"normal", "agentic"} {
 			t.Run(mode+"/"+selection, func(t *testing.T) {
 				f := newAgenticFixture(t, mode)
-				if selection == "normal" {
-					f.a.watcher.config.Orgs[0].Repos[0].Mode.Agentic = AgenticConfig{}
-				}
+				w := f.a.watcher
 				if mode == "lgtm" {
-					f.a.watcher, f.a.lgtmWatcher = &watcher{}, f.a.watcher
+					w = f.a.lgtmWatcher
 				}
-				provider := NewConfigDataProvider(f.a.config, func() []string { return []string{"org/repo"} }, f.a.logger)
+				if selection == "normal" {
+					w.config.Orgs[0].Repos[0].Mode.Agentic = AgenticConfig{}
+				}
+				provider := NewConfigDataProvider(func() *config.Config { return f.cfg }, func() []string { return []string{"org/repo"} }, f.a.logger)
 				cw := &clientWrapper{ghc: f.gh, agentic: f.a, watcher: f.a.watcher, lgtmWatcher: f.a.lgtmWatcher, configDataProvider: provider}
 				cw.handlePullRequestCreation(f.a.logger, github.PullRequestEvent{
 					Action: github.PullRequestActionOpened, Repo: f.gh.pr.Base.Repo, PullRequest: f.gh.pr})
-				if len(f.gh.comments) != 1 || f.gh.comments[0].Body != pullRequestInfoComment || f.gh.statusWrites != 0 || f.jobs.creates != 0 {
+				if len(f.gh.comments) != 1 || f.gh.comments[0].Body != pullRequestInfoComment || f.gh.statusWrites != 0 {
 					t.Fatal("opening event did not post only the universal notification")
 				}
 				if selection == "normal" && f.gh.getPullRequestCalls != 0 {

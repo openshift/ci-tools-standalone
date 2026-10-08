@@ -6,9 +6,27 @@ The Pipeline Controller is a tool that manages the execution of second-stage tes
 
 The Pipeline Controller operates in three distinct modes, each offering different levels of automation for triggering second-stage tests. Second-stage tests are tests that run after the initial required tests pass, typically integration tests, optional tests, or tests that depend on specific file changes.
 
-All modes support [agentic selection](#agentic-selection-chai). Otherwise,
+All modes support [agentic handoff](#agentic-handoff-chai). Otherwise,
 the normal-selection behavior below applies.
 The same opening notification is used with either selection method.
+
+With GitHub App authentication, traditional pipelines create
+`ci/pipeline-gate` on PR open/push/reopen. It stays pending until the configured
+trigger dispatches the applicable jobs through a `/test` comment, then succeeds
+without waiting for test results or Chai. An empty/already-dispatched selection
+also succeeds; planning or dispatch errors never turn it green. Individual job
+contexts gate test results and are published pending before `/test`.
+Publication failures block scheduling. Require the controller-App check in
+Tide/branch protection on enrolled branches to prevent merges when dispatch is missed.
+Empty retries leave successful checks unchanged. No additional flags, storage
+or startup scan are needed for traditional mode.
+
+`/pipeline help` lists all commands with short descriptions.
+`/pipeline mark-pipeline-gate [<HEAD>]` makes an existing `ci/pipeline-gate` green
+(organization members or repository collaborators; configured Chai in agentic mode).
+A supplied full HEAD SHA must match the current PR HEAD; without it, the command
+targets the current HEAD when processed. It does not run tests or override their results.
+A new push starts a fresh pipeline.
 
 ## Three Operating Modes
 
@@ -205,7 +223,7 @@ If you manually trigger some second-stage tests (using `/test <job-name>`) in Au
 
 This complements manual triggers without re-running jobs that already started. If nothing remains to schedule because every applicable job already ran for the current HEAD, the controller says so rather than claiming no tests were triggered. To re-run a specific job that already ran, use `/test <job>`; to run the delta on demand, use `/pipeline remaining`.
 
-## Agentic Selection (Chai)
+## Agentic Handoff (Chai)
 
 Enable Chai in the main or LGTM enrollment configuration:
 
@@ -215,68 +233,41 @@ Enable Chai in the main or LGTM enrollment configuration:
   mode: {trigger: auto, agentic: {mode: chai}}
 ```
 
-Global flags: `--agentic-trusted-author=<chai-login>` (required, repeatable),
-`--agentic-state-dir=/var/lib/pipeline-controller` (required outside dry run),
-and `--agentic-timeout=20m` (default); no repository-level trust/timeout.
+Requires GitHub App authentication, `--agentic-trusted-author=<chai-login>`
+(repeatable) and optional `--agentic-timeout=20m`. There is no storage requirement.
 
-No check is created until all applicable required first-stage jobs pass.
-The controller then creates `ci/tests-dispatched` as `in_progress`.
-Chai reacts to `check_run.created` and posts:
+1. Applicable first-stage tests pass in the shared ProwJob cache (including overrides).
+   Create `ci/pipeline-gate` **queued**; `check_run.created` signals Chai and starts its response timeout.
+2. Any new comment from a configured Chai author after readiness and within the timeout
+   cancels it; no acknowledgement command or HEAD is needed. The gate stays pending.
+3. Chai owns test selection, context publication and dispatch. It marks completion
+   with `/pipeline mark-pipeline-gate <HEAD>` after native job contexts block merging.
+   The controller does not parse plans, validate jobs or wait for their results.
 
-```markdown
-Chai test plan for `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` → `main`
+Without a Chai comment, the controller returns to traditional selection and `/test`
+dispatch for this revision, respecting first-stage success and auto/manual/LGTM triggers.
+Chai must respect the response deadline and must not dispatch after fallback or opt-out;
+Late comments do not reclaim dispatch, and late completion commands are rejected.
+After Chai responds there is no completion timeout: use `/pipeline skip-agentic-mode` for recovery.
 
-- `pull-ci-example-main-e2e`
-```
+- `/pipeline skip-agentic-mode` adds `pipeline-skip-agentic-mode`, persistent across pushes/restarts.
+- `/pipeline agentic-mode` restores supported agentic mode, invalidates old completion
+  and creates a fresh readiness signal after first-stage success. Already-agentic PRs are unchanged.
+- Actual mode switches invalidate previous completion; repeat commands preserve it.
+- `/pipeline required` and `/pipeline remaining` are rejected, not queued, while agentic.
+  `/pipeline auto` only sets the existing LGTM auto label. Running tests are never cancelled.
 
-Use the full 40-character SHA, `None.` for no jobs and an optional final `Reason: ...`.
-The controller validates trusted author, revision and eligible job names, not relevance.
-For re-review, Chai verifies controller identity/current refs and echoes the 32-character `Request:` ID:
+New HEAD/base resets the cycle. Timers and timeout fallback are memory-only and may
+be lost on restart; owned checks and PR opt-out labels remain. Existing completed
+gates are not reset. No startup PR scan, historical-job replay, polling or PVC recovery.
+Missed events may need another event or manual command; operational retries are bounded.
 
-```markdown
-Chai test selection requested for `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` → `main`.
-
-Request: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`
-```
-
-Both paths use the latest matching ProwJobs for first-stage success, including `/override`.
-Dispatch rechecks first-stage success and waits for the existing trigger. The timeout
-starts after first-stage success and falls back to normal selection. Late plans
-cannot replace fallback or a dispatched selection; push a new commit to change it.
-
-- `/pipeline required` reruns the selected set; `/pipeline remaining` runs only missing jobs. Before a valid selection exists, they are rejected with a comment, not queued; post the command again after Chai or timeout selects the jobs.
-- `/pipeline agent-review` requests a fresh plan with a new timeout and clears opt-out before dispatch; use it after a same-SHA base retarget.
-- `/pipeline skip-agent-review` adds `pipeline-skip-agent-review`: normal selection persists across pushes; already-dispatched jobs stay unchanged.
-
-`ci/tests-dispatched` succeeds only when all first-stage and selected second-stage
-jobs pass. Results come from the shared ProwJob cache, not GitHub statuses or
-reporter acknowledgments. Same-second runs are treated conservatively: a tied
-pending or failing run blocks success. Both modes post `/test` comments; Hook creates jobs.
-Requests are saved before posting and retries deduplicate controller-authored
-comments. Posting alone never opens the gate. Forced reruns exclude existing
-runs and reopen the same check before dispatch; a missing Hook event needs a
-new manual command. A new SHA starts a new decision/check; old results do not count.
-
-One compact JSON record per PR on the existing PVC stores intent, gate identity
-and success witnesses for jobs Sinker removes—not GitHub status history or retry
-timers. New revisions reset it; observed closure deletes it. Malformed state
-blocks startup and is preserved for repair.
-The record schema is now version 2. If upgrading an older agentic deployment,
-use a fresh state directory (retain the old one) and fresh PR heads.
-Optional `--agentic-state-ttl=720h` expires PR records unmodified for 30 days (`0`: disabled). Age uses last file modification, refreshed by successful writes, not PR creation. Cleanup checks locally at startup, periodically and before reuse; no GitHub calls. Even open PRs lose their saved decision and may rerun tests; gates stay unchanged until another event. Temporary files are not covered.
-Enabling TTL permanently requires a fresh post-tracking plan when local state is missing, even if TTL is later disabled. Tracked PRs still accept early plans for new commits.
-The standard PR-keyed workqueue restores only selection deadlines and unfinished
-actions. No GitHub scan, initial-job replay or polling; missed events may require
-another event or manual command. Operational retries honor server cooldowns.
-Dispatch and gate completion still validate current refs and authorization; selected contexts remain tracked after configuration changes.
-
-Before enrolling:
-
-- Configure Chai's authenticated **Check runs** and **Issue comments** webhook delivery and matching identities; forward `pull_request` and `issue_comment` to the controller. GitHub emits no queued-to-in-progress webhook, so creation is the wake-up.
-- Grant App Checks read/write, PR/comment/label/member access; Kubernetes ProwJob `get/list/watch`. Keep permissions needed by ordinary mode. Use distinct HEADs.
-- Mount a durable, writable PVC supporting file locks, atomic rename and `fsync` at `--agentic-state-dir`; deploy one replica with `Recreate`. An exclusive file lock rejects a second writer. Back up the volume; do not prune open-PR state. Normal-only enrollment and dry run need no storage.
-- Require the controller-App gate in GitHub and Tide only on enrolled branches; make it optional elsewhere. Keep other required contexts and Tide batch coverage.
-- Enroll a fresh HEAD if old placeholders remain; rerun first-stage jobs removed before success was recorded. Deployment configuration is in `openshift/release`.
+Rollout: update Chai's **Check runs** signal and commands, require `ci/pipeline-gate`
+in Tide/branch protection, and retire the old `ci/tests-dispatched` requirement.
+Remove `--agentic-state-dir`/`--agentic-state-ttl` arguments and the unused PVC mount;
+coordinate argument removal with the image update: old arguments make the new binary
+reject startup. Existing old check names/plan comments are not supported.
+Keep one active controller replica with `Recreate`; no leader election is added.
 
 ## Enrolling Repository
 

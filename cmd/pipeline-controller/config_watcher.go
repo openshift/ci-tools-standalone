@@ -11,7 +11,7 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-// AgenticConfig selects a planner without changing the repository's trigger mode.
+// AgenticConfig hands second-stage execution to Chai without changing the fallback trigger.
 type AgenticConfig struct {
 	Mode string `yaml:"mode,omitempty"`
 }

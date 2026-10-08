@@ -208,7 +208,7 @@ func TestSendCommentWithMode_ProtectedDedup(t *testing.T) {
 			deleteIdsCalled := false
 			deleteIds := func() { deleteIdsCalled = true }
 
-			err := sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, tc.mode, true)
+			err := sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, tc.mode, true, nil)
 			if err != nil {
 				t.Fatalf("sendCommentWithMode returned error: %v", err)
 			}
@@ -319,7 +319,7 @@ func TestSendCommentWithMode_ConditionalDelta(t *testing.T) {
 			presubmits := presubmitTests{pipelineConditionallyRequired: conditionalPresubmits}
 			pj := makeTriggerPJ(sha)
 
-			if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, tc.mode, true); err != nil {
+			if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, tc.mode, true, nil); err != nil {
 				t.Fatalf("sendCommentWithMode returned error: %v", err)
 			}
 			if len(ghc.comments) != 1 {
@@ -381,7 +381,7 @@ func TestSendCommentWithMode_DeltaDoesNotSuppressProtected(t *testing.T) {
 	pjLister := newFakePJLister(makeProwJob(conditionalJob, sha))
 	pj := makeTriggerPJ(sha)
 
-	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta, true); err != nil {
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta, true, nil); err != nil {
 		t.Fatalf("sendCommentWithMode returned error: %v", err)
 	}
 	if len(ghc.comments) != 1 {
@@ -432,7 +432,7 @@ func TestSendCommentWithMode_DeltaListErrorFailsClosed(t *testing.T) {
 	pj := makeTriggerPJ(sha)
 
 	deleteIdsCalled := false
-	err := sendCommentWithMode(presubmits, pj, ghc, func() { deleteIdsCalled = true }, errorLister{}, modeDelta, true)
+	err := sendCommentWithMode(presubmits, pj, ghc, func() { deleteIdsCalled = true }, errorLister{}, modeDelta, true, nil)
 	if err == nil {
 		t.Fatal("expected an error from modeDelta list failure, got nil")
 	}
@@ -466,7 +466,7 @@ func TestSendCommentWithMode_DeltaNilListerNoPanic(t *testing.T) {
 	ghc := &fakeGhClient{changes: []github.PullRequestChange{{Filename: "cmd/main.go"}}}
 	pj := makeTriggerPJ(sha)
 
-	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, nil, modeDelta, true); err != nil {
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, nil, modeDelta, true, nil); err != nil {
 		t.Fatalf("sendCommentWithMode returned error: %v", err)
 	}
 	if len(ghc.comments) != 1 || !strings.Contains(ghc.comments[0], "/test "+conditionalJob) {
@@ -500,7 +500,7 @@ func TestSendCommentWithMode_DeltaNewHeadReEvaluates(t *testing.T) {
 	pjLister := newFakePJLister(makeProwJob(conditionalJob, oldSHA))
 	pj := makeTriggerPJ(newSHA)
 
-	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta, true); err != nil {
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta, true, nil); err != nil {
 		t.Fatalf("sendCommentWithMode returned error: %v", err)
 	}
 	if len(ghc.comments) != 1 || !strings.Contains(ghc.comments[0], "/test "+conditionalJob) {
@@ -545,7 +545,7 @@ func TestSendCommentWithMode_DeltaEmptyWithOnlyFirstStageJobs(t *testing.T) {
 	pjLister := newFakePJLister(makeProwJob(firstStageJob, sha))
 	pj := makeTriggerPJ(sha)
 
-	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta, true); err != nil {
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta, true, nil); err != nil {
 		t.Fatalf("sendCommentWithMode returned error: %v", err)
 	}
 	if len(ghc.comments) != 1 {
@@ -587,7 +587,7 @@ func TestSendCommentWithMode_ImplicitEmptyIsSilent(t *testing.T) {
 
 	// Implicit (automatic) trigger: must stay silent.
 	ghcImplicit := &fakeGhClient{changes: changes}
-	if err := sendCommentWithMode(presubmits, makeTriggerPJ(sha), ghcImplicit, func() {}, newFakePJLister(existing...), modeDelta, false); err != nil {
+	if err := sendCommentWithMode(presubmits, makeTriggerPJ(sha), ghcImplicit, func() {}, newFakePJLister(existing...), modeDelta, false, nil); err != nil {
 		t.Fatalf("sendCommentWithMode(implicit) returned error: %v", err)
 	}
 	if len(ghcImplicit.comments) != 0 {
@@ -596,7 +596,7 @@ func TestSendCommentWithMode_ImplicitEmptyIsSilent(t *testing.T) {
 
 	// Explicit command for the same state: still acknowledges.
 	ghcExplicit := &fakeGhClient{changes: changes}
-	if err := sendCommentWithMode(presubmits, makeTriggerPJ(sha), ghcExplicit, func() {}, newFakePJLister(existing...), modeDelta, true); err != nil {
+	if err := sendCommentWithMode(presubmits, makeTriggerPJ(sha), ghcExplicit, func() {}, newFakePJLister(existing...), modeDelta, true, nil); err != nil {
 		t.Fatalf("sendCommentWithMode(explicit) returned error: %v", err)
 	}
 	if len(ghcExplicit.comments) != 1 || !strings.Contains(ghcExplicit.comments[0], "already been triggered") {
@@ -652,7 +652,10 @@ func TestExistsAtSHA(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			pjLister := newFakePJLister(tc.existingPJs...)
-			got := existsAtSHA(context.Background(), pjLister, pj, tc.jobName)
+			got, err := existsAtSHA(context.Background(), pjLister, pj, tc.jobName)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if got != tc.wantExists {
 				t.Errorf("existsAtSHA() = %v, want %v", got, tc.wantExists)
 			}

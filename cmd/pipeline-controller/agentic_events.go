@@ -1,285 +1,195 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"regexp"
-	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
+	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/github"
 )
 
-var agenticCommandRE = regexp.MustCompile(`(?im)^/pipeline[\t ]+(required|remaining|auto|agent-review|skip-agent-review)[\t ]*$`)
-
-// Preserve ordinary-mode command prefixes while filtering unrelated comments
-// before any GitHub read, including in mixed-mode repositories.
-var pipelineCommentRE = regexp.MustCompile(`(?im)^/pipeline\s+(required|remaining|auto|agent-review|skip-agent-review)`)
-
-func validAgenticCommand(command string) bool {
-	switch command {
-	case "required", "remaining", "auto", "agent-review", "skip-agent-review":
-		return true
-	default:
-		return false
-	}
-}
-
-func (a *agenticController) recordCommand(gate *github.CheckRun, state *agenticState, pr *github.PullRequest, comment github.IssueComment, comments []github.IssueComment) error {
-	matches := agenticCommandRE.FindAllStringSubmatch(comment.Body, -1)
-	if len(matches) != 1 || comment.ID <= state.LastCommandID || comment.ID <= 0 {
+func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *github.PullRequest, cfg RepoConfig, comment github.IssueComment) error {
+	command, ok := parsePipelineCommand(comment.Body)
+	if !ok || comment.ID <= 0 || comment.ID <= s.lastCommand {
 		return nil
 	}
-	// Once a gate observes a new revision, delayed deliveries of older commands
-	// cannot authorize it. Recorded command decisions survive
-	// restarts without reinterpreting comment text against another HEAD.
-	if comment.CreatedAt.IsZero() || comment.CreatedAt.Before(state.ObservedAt) {
-		return nil
-	}
-	trusted, err := a.trustedCommandAuthor(state.Org, state.Repo, comment.User.Login)
-	if err != nil {
-		return err
-	}
-	if !trusted {
-		return nil
-	}
-	command := &agenticCommand{Command: strings.ToLower(matches[0][1])}
-	if command.Command == "required" || command.Command == "remaining" {
-		if err := a.refreshPlan(state, pr, comments); err != nil {
-			if _, pending := err.(agenticPlanPendingError); !pending {
-				return err
-			}
-		}
-		// A missed early command must not be revived by a later Chai comment.
-		command.Rejected = state.Plan == nil || (state.Plan.Source == "chai" && state.Plan.CommentID > comment.ID)
-	}
-	state.LastCommandID = comment.ID
-	state.Command = command
-	return a.saveState(gate, state, "", "Pipeline request recorded for this HEAD/base.")
-}
-
-func (a *agenticController) trustedCommandAuthor(org, repo, login string) (bool, error) {
-	if login == "" {
-		return false, nil
-	}
-	member, err := a.gh.IsMember(org, login)
-	if err != nil || member {
-		return member, err
-	}
-	return a.gh.IsCollaborator(org, repo, login)
-}
-
-func (a *agenticController) explainUnboundCommand(state *agenticState, comment github.IssueComment, comments []github.IssueComment) error {
-	if state.Command != nil || state.ManualRequestID != 0 || comment.ID > state.LastCommandID || !agenticCommandRE.MatchString(comment.Body) {
-		return nil
-	}
-	trusted, err := a.trustedCommandAuthor(state.Org, state.Repo, comment.User.Login)
-	if err != nil || !trusted {
-		return err
-	}
-	body := fmt.Sprintf("This command predates tracking of `%s` → `%s`. Please post it again for this revision.\n\n<!-- pipeline-controller:command:%d -->", state.HeadSHA, state.BaseBranch, comment.ID)
-	return a.ensureComment(state, comments, body)
-}
-
-func (a *agenticController) ensureComment(state *agenticState, comments []github.IssueComment, body string) error {
-	isBot, err := a.gh.BotUserChecker()
-	if err != nil {
-		return err
-	}
-	for _, comment := range comments {
-		if isBot(comment.User.Login) && comment.Body == body {
-			return nil
+	chai := a.trustedChai(comment.User.Login)
+	if !chai || command.name != "mark-pipeline-gate" {
+		trusted, err := trustedPipelineCommandAuthor(a.gh, work.org, work.repo, comment.User.Login)
+		if err != nil || !trusted {
+			return err
 		}
 	}
-	return a.gh.CreateComment(state.Org, state.Repo, state.Number, body)
-}
-
-func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticState, cfg RepoConfig, pr *github.PullRequest, comments []github.IssueComment) error {
-	if command := state.Command; command != nil && !command.Applied {
-		if command.Rejected {
-			body := fmt.Sprintf("Cannot run `/pipeline %s`: test selection is not ready. Retry after Chai or the controller selects jobs. This request is not queued.\n\n<!-- pipeline-controller:command:%d -->", command.Command, state.LastCommandID)
-			if err := a.ensureComment(state, comments, body); err != nil {
-				return err
-			}
-			command.Applied = true
-			return a.saveState(gate, state, "", "Pipeline request rejected: waiting for test selection.")
+	reply := func(message string) error { return a.gh.CreateComment(work.org, work.repo, work.number, message) }
+	var err error
+	switch command.name {
+	case "required", "remaining":
+		if !s.optOut && !s.timedOut {
+			err = reply("The controller does not dispatch second-stage tests in agentic mode. Use `/pipeline skip-agentic-mode` first, then repeat this command. The request was not queued.")
+			break
 		}
-		switch command.Command {
-		case "required":
-			state.ManualRequestID, state.ForceRequestID = state.LastCommandID, state.LastCommandID
-			state.Dispatch = nil
-		case "remaining":
-			state.ManualRequestID = state.LastCommandID
-			state.ForceRequestID = 0
-		case "auto":
-			if cfg.Trigger != "lgtm" {
-				body := fmt.Sprintf("`/pipeline auto` is available only in LGTM mode.\n\n<!-- pipeline-controller:command:%d -->", state.LastCommandID)
-				if err := a.ensureComment(state, comments, body); err != nil {
-					return err
-				}
-			} else if !hasAgenticLabel(pr, PipelineAutoLabel) {
-				if err := a.gh.AddLabel(state.Org, state.Repo, state.Number, PipelineAutoLabel); err != nil {
-					return err
-				}
+		if command.name == "remaining" && s.dispatched {
+			err = reply("The second stage has already been scheduled for this HEAD; nothing further to trigger.")
+			break
+		}
+		mode := modeForce
+		if command.name == "remaining" {
+			mode = modeDelta
+		}
+		pj := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: pullRefs(work.org, work.repo, pr)}}
+		err = sendCommentWithMode(a.configDataProvider.GetPresubmits(work.org+"/"+work.repo), pj, a.gh, func() {}, a.reader, mode, true, a.checks)
+		if err == nil {
+			s.dispatched = true
+		}
+	case "auto":
+		if cfg.Trigger != "lgtm" {
+			err = reply("`/pipeline auto` is available only in LGTM mode.")
+		} else if !hasAgenticLabel(pr, PipelineAutoLabel) {
+			err = a.gh.AddLabel(work.org, work.repo, work.number, PipelineAutoLabel)
+			if err == nil {
 				pr.Labels = append(pr.Labels, github.Label{Name: PipelineAutoLabel})
 			}
-		case "skip-agent-review":
-			if !hasAgenticLabel(pr, agenticSkipLabel) {
-				if err := a.gh.AddLabel(state.Org, state.Repo, state.Number, agenticSkipLabel); err != nil {
-					return err
-				}
-				pr.Labels = append(pr.Labels, github.Label{Name: agenticSkipLabel})
+		}
+	case "skip-agentic-mode":
+		if !s.optOut && !s.timedOut {
+			// Invalidate agentic completion before persisting the ownership change,
+			// including when GitHub applies the label but loses its response.
+			if err = a.checks.pendingWithReset(pullRefs(work.org, work.repo, pr), true); err != nil {
+				break
 			}
-			if !state.Frozen {
-				state.Plan, state.WaitingSince = nil, nil
-			} else {
-				body := fmt.Sprintf("Normal selection is enabled for future pushes. The dispatched selection for `%s` is already fixed.\n\n<!-- pipeline-controller:command:%d -->", state.HeadSHA, state.LastCommandID)
-				if err := a.ensureComment(state, comments, body); err != nil {
-					return err
+			s.dispatched = false
+		}
+		if !s.optOut {
+			err = a.gh.AddLabel(work.org, work.repo, work.number, agenticSkipLabel)
+		}
+		if err == nil {
+			s.optOut, s.waitingUntil = true, time.Time{}
+			err = reply("Traditional pipeline scheduling is enabled for this PR and future pushes. Running tests are unchanged.")
+		}
+	case "agentic-mode":
+		if !s.optOut && !s.timedOut {
+			err = reply("Agentic mode is already enabled. The gate and response timeout are unchanged.")
+			break
+		}
+		if err == nil {
+			var gate *github.CheckRun
+			gate, err = findPipelineCheck(a.gh, a.appID, work.org, work.repo, pr.Head.SHA)
+			if err == nil && gate.ID != 0 {
+				if !strings.HasPrefix(gate.ExternalID, pipelinePRIdentity(work.org, work.repo, pr.Number)+":") {
+					err = fmt.Errorf("no active owned pipeline gate for this PR/revision")
+				} else {
+					err = a.retireCheck(work, *gate)
 				}
-			}
-		case "agent-review":
-			if state.Frozen {
-				body := fmt.Sprintf("The selection for `%s` is already dispatched and cannot be replaced. Push a new commit to request a new selection.\n\n<!-- pipeline-controller:command:%d -->", state.HeadSHA, state.LastCommandID)
-				if err := a.ensureComment(state, comments, body); err != nil {
-					return err
-				}
-			} else {
-				if hasAgenticLabel(pr, agenticSkipLabel) {
-					if err := a.gh.RemoveLabel(state.Org, state.Repo, state.Number, agenticSkipLabel); err != nil {
-						return err
-					}
-					var labels []github.Label
-					for _, label := range pr.Labels {
-						if label.Name != agenticSkipLabel {
-							labels = append(labels, label)
-						}
-					}
-					pr.Labels = labels
-				}
-				state.Plan = nil
-				state.WaitingSince = nil
-				if state.ActivatedAt != nil {
-					now := a.currentTime()
-					state.WaitingSince = &now
-				}
-				state.Review = &agenticReviewRequest{HeadSHA: state.HeadSHA, BaseBranch: state.BaseBranch,
-					RequestID: agenticID(state.Org, state.Repo, strconv.Itoa(state.Number), state.HeadSHA, state.BaseBranch, strconv.Itoa(state.LastCommandID))}
-				state.ReviewPosted = false
 			}
 		}
-		command.Applied = true
-		state.PendingDispatch = true // The command's resulting decision is not yet reconciled.
-		if err := a.saveState(gate, state, "", "Pipeline request accepted; waiting for dispatch prerequisites."); err != nil {
-			return err
+		if err == nil && s.optOut {
+			err = a.gh.RemoveLabel(work.org, work.repo, work.number, agenticSkipLabel)
+		}
+		if err == nil {
+			s.optOut, s.timedOut, s.dispatched = false, false, false
+			s.ready, s.fresh, s.waitingUntil = false, true, time.Time{}
+			err = reply("Agentic mode is restored. First-stage success will create a fresh pending pipeline gate. Running tests are unchanged.")
+		}
+	case "mark-pipeline-gate":
+		if chai && (s.optOut || s.timedOut) {
+			err = reply("Agentic command rejected: traditional scheduling owns this revision. Do not start agentic dispatch unless agentic mode is restored.")
+			break
+		}
+		if command.head != "" && command.head != pr.Head.SHA {
+			err = reply(fmt.Sprintf("Command rejected: HEAD `%s` is not the current PR HEAD `%s`.", command.head, pr.Head.SHA))
+			break
+		}
+		if s.optOut || s.timedOut {
+			err = a.checks.markGate(pullRefs(work.org, work.repo, pr), comment.ID)
+			if err == nil {
+				s.dispatched = true
+			}
+			break
+		}
+		if !s.ready && !s.fresh {
+			var gate *github.CheckRun
+			gate, err = findPipelineCheck(a.gh, a.appID, work.org, work.repo, pr.Head.SHA)
+			if err == nil && gate.ExternalID == pipelineExternalID(pullRefs(work.org, work.repo, pr)) && nativeAgenticReadiness(gate) {
+				s.gate, s.ready = *gate, true
+			}
+		}
+		if err != nil {
+			break
+		}
+		if !s.ready || (chai && !s.publishedAt.IsZero() && !comment.CreatedAt.IsZero() && comment.CreatedAt.Before(s.publishedAt)) {
+			err = reply("There is no active agentic readiness gate for this revision. Wait for first-stage success and repeat the command.")
+			break
+		}
+		if chai && !s.waitingUntil.IsZero() && comment.CreatedAt.After(s.waitingUntil) {
+			err = reply("Agentic completion rejected: the response timeout expired. Traditional scheduling owns this revision.")
+			break
+		}
+		s.waitingUntil = time.Time{} // This is a response timeout, not a dispatch deadline.
+		err = a.checks.markGate(pullRefs(work.org, work.repo, pr), comment.ID)
+		if err == nil {
+			s.gate.Status, s.gate.Conclusion = "completed", "success"
 		}
 	}
-	if state.Review != nil && !state.ReviewPosted && state.ActivatedAt != nil {
-		if err := a.ensureComment(state, comments, formatAgenticReview(*state.Review)); err != nil {
-			return err
-		}
-		state.ReviewPosted = true
-		return a.saveState(gate, state, "", "Fresh Chai selection requested through the PR comment.")
+	if err == nil {
+		s.lastCommand = comment.ID
 	}
-	return nil
+	return err
 }
 
 func (a *agenticController) handleIssueComment(logger *logrus.Entry, event github.IssueCommentEvent) bool {
-	if !event.Issue.IsPullRequest() || a == nil || !a.hasRepo(event.Repo.Owner.Login, event.Repo.Name) {
+	if a == nil || !event.Issue.IsPullRequest() || !a.hasRepo(event.Repo.Owner.Login, event.Repo.Name) {
 		return false
 	}
-	if !isAgenticPlanComment(event.Comment.Body) && !pipelineCommentRE.MatchString(event.Comment.Body) {
-		return true
-	}
-	a.queueMu.Lock()
-	shutdown := a.queue != nil && a.queue.ShuttingDown()
-	cooldown := a.retryAt[agenticWork{org: event.Repo.Owner.Login, repo: event.Repo.Name, number: event.Issue.Number}].After(a.currentTime())
-	a.queueMu.Unlock()
-	if shutdown {
-		return true
-	}
-	var command *github.IssueComment
-	if event.Action == github.IssueCommentActionCreated {
-		command = &event.Comment
-	}
-	if cooldown {
-		a.enqueue(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, command)
-		return true // The worker honors the cooldown and rereads live PR metadata.
-	}
-	pr, err := a.gh.GetPullRequest(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number)
-	if err != nil {
-		logger.WithError(err).Error("Cannot determine agentic configuration")
-		if retry := agenticRetryFor(err); retry.after > 0 {
-			a.queueMu.Lock()
-			a.rememberCooldownLocked(agenticWork{org: event.Repo.Owner.Login, repo: event.Repo.Name, number: event.Issue.Number}, retry.after)
-			a.queueMu.Unlock()
+	command, ok := parsePipelineCommand(event.Comment.Body)
+	if !ok {
+		if !a.trustedChai(event.Comment.User.Login) {
+			return false
 		}
-		a.enqueue(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, command)
-		return true // fail closed instead of falling through to /test dispatch
+		if event.Action == github.IssueCommentActionCreated {
+			a.enqueue(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, &event.Comment)
+		}
+		return true
 	}
-	if _, enabled := a.repoConfig(event.Repo.Owner.Login, event.Repo.Name, pr.Base.Ref); !enabled {
+	if event.Action != github.IssueCommentActionCreated {
+		return true
+	}
+	org, repo := event.Repo.Owner.Login, event.Repo.Name
+	pr, err := a.gh.GetPullRequest(org, repo, event.Issue.Number)
+	if err != nil {
+		logger.WithError(err).Error("Cannot safely route pipeline command")
+		a.enqueue(org, repo, event.Issue.Number, &event.Comment)
+		return true
+	}
+	if _, enabled := a.repoConfig(org, repo, pr.Base.Ref); !enabled {
+		if command.name == "agentic-mode" || command.name == "skip-agentic-mode" {
+			if err := a.gh.CreateComment(org, repo, pr.Number, "Agentic mode is not configured for this repository/branch."); err != nil {
+				logger.WithError(err).Error("Cannot explain unavailable mode")
+			}
+			return true
+		}
 		return false
 	}
-	if event.Action == github.IssueCommentActionDeleted {
-		return true
-	}
-	if !isAgenticPlanComment(event.Comment.Body) && !agenticCommandRE.MatchString(event.Comment.Body) {
-		return true
-	}
-	a.enqueue(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, command)
+	a.enqueue(org, repo, event.Issue.Number, &event.Comment)
 	return true
 }
 
 func (a *agenticController) handlePullRequest(_ *logrus.Entry, event github.PullRequestEvent) {
-	if !a.hasRepo(event.Repo.Owner.Login, event.Repo.Name) {
-		return
+	if a.hasRepo(event.Repo.Owner.Login, event.Repo.Name) {
+		a.enqueue(event.Repo.Owner.Login, event.Repo.Name, event.PullRequest.Number, nil)
 	}
-	a.enqueue(event.Repo.Owner.Login, event.Repo.Name, event.PullRequest.Number, nil)
 }
 
-func (a *agenticController) hasRepo(org, repo string) bool {
-	if a == nil {
-		return false
-	}
-	for _, watcher := range []*watcher{a.watcher, a.lgtmWatcher} {
-		if watcher != nil && watcher.getConfig()[org][repo].Agentic.enabled() {
-			return true
-		}
-	}
-	return false
-}
-
-func (a *agenticController) hasAgenticEnrollment() bool {
-	for _, watcher := range []*watcher{a.watcher, a.lgtmWatcher} {
-		if watcher == nil {
-			continue
-		}
-		for _, repos := range watcher.getConfig() {
-			for _, cfg := range repos {
-				if cfg.Agentic.enabled() {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-// Mixed-mode events must match the live PR. Universal notifications may reach
-// agentic branches; legacy placeholders and dispatch must not. Normal-only
-// repositories retain their existing behavior without an extra GitHub read.
+// Protect mixed-mode branches from delayed webhook and ProwJob snapshots.
 func (a *agenticController) allowSnapshot(org, repo string, number int, head, base string, allowAgentic bool) (bool, error) {
 	if !a.hasRepo(org, repo) {
 		return true, nil
 	}
-	a.mu.Lock()
-	stopped := a.stopped
-	a.mu.Unlock()
-	if stopped || (allowAgentic && a.dryRun) {
-		return false, nil
-	}
 	if _, enabled := a.repoConfig(org, repo, base); enabled && !allowAgentic {
+		return false, nil // Agentic and fallback events are handled by the worker.
+	}
+	if a.dryRun {
 		return false, nil
 	}
 	pr, err := a.gh.GetPullRequest(org, repo, number)
@@ -298,80 +208,10 @@ func (cw *clientWrapper) allowPullRequestSnapshot(logger *logrus.Entry, event gi
 	return allowed && err == nil
 }
 
-// Restart restores local deadlines and explicitly unfinished actions only.
-// Missed events are accepted; there is no startup or periodic GitHub sweep.
-func (a *agenticController) Run(ctx context.Context) error {
-	a.mu.Lock()
-	a.stopped = false
-	a.mu.Unlock()
-	if err := a.prepareStore(); err != nil {
-		return fmt.Errorf("opening agentic state: %w", err)
-	}
-	a.startQueue(ctx)
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			a.queue.ShutDown()
-		case <-done:
-		}
-	}()
-	defer func() {
-		close(done)
-		a.queue.ShutDown()
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		a.stopped = true
-		if err := a.closeStoreLocked(); err != nil {
-			a.logger.WithError(err).Error("Cannot close agentic state directory")
-		}
-	}()
-	if ctx.Err() != nil {
-		return nil
-	}
-	if err := a.restoreRecords(ctx); err != nil {
-		return fmt.Errorf("restoring agentic records: %w", err)
-	}
-	for a.processNext(ctx) {
-	}
-	return nil
-}
-
-// Reevaluate already tracked PRs on explicit configuration changes, without
-// discovering new PRs or scanning GitHub repositories.
 func (a *agenticController) configurationChanged() {
 	a.mu.Lock()
-	ctx := a.queueCtx
-	if a.stopped || a.dryRun || ctx == nil || ctx.Err() != nil {
-		a.mu.Unlock()
-		return
-	}
-	if err := a.prepareStoreLocked(); err != nil {
-		a.mu.Unlock()
-		a.logger.WithError(err).Error("Cannot reload tracked agentic PRs")
-		return
-	}
-	if a.store == nil {
-		a.mu.Unlock()
-		return
-	}
-	names := a.store.recordNames()
-	a.mu.Unlock()
-	for _, name := range names {
-		a.mu.Lock()
-		if a.stopped || ctx.Err() != nil {
-			a.mu.Unlock()
-			return
-		}
-		r, err := a.readStoredRecord(ctx, name)
-		if err != nil {
-			a.mu.Unlock()
-			a.logger.WithError(err).Error("Cannot reload tracked agentic PR")
-			return
-		}
-		if r != nil {
-			a.enqueue(r.State.Org, r.State.Repo, r.State.Number, nil)
-		}
-		a.mu.Unlock()
+	defer a.mu.Unlock()
+	for work := range a.states {
+		a.enqueue(work.org, work.repo, work.number, nil)
 	}
 }

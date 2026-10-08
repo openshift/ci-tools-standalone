@@ -33,11 +33,6 @@ type minimalGhClient interface {
 	GetIssueLabels(org, repo string, number int) ([]github.Label, error)
 }
 
-func sendComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader) error {
-	// Automatic triggers (reconciler auto path, LGTM) are implicit: explicit=false.
-	return sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, modeDelta, false)
-}
-
 // sendCommentWithMode plans and posts the second-stage scheduling comment.
 // explicit is true when the run was requested by a human /pipeline command; it
 // controls whether a "nothing to schedule" acknowledgment is posted. Automatic
@@ -46,24 +41,47 @@ func sendComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient,
 // duplicate "already triggered"/"no tests" notes that otherwise recur on every
 // reconcile/LGTM pass and across restarts (the per-handler dedup caches are
 // separate and in-memory).
-func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, mode scheduleMode, explicit bool) error {
+func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, mode scheduleMode, explicit bool, checks *dispatchChecks) error {
+	if checks != nil {
+		checks.mu.Lock()
+		defer checks.mu.Unlock()
+	}
+	comment, jobs, err := planDispatchComment(presubmits, pj, ghc, pjLister, mode, explicit)
+	if err == nil {
+		err = checks.dispatch(pj.Spec.Refs, len(jobs) != 0, func() error {
+			if comment == "" {
+				return nil
+			}
+			if checks != nil {
+				if err := publishPendingContexts(ghc, pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].SHA, jobs); err != nil {
+					return err
+				}
+			}
+			return ghc.CreateComment(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number, comment)
+		})
+	}
+	if err != nil {
+		deleteIds() // Check publication failures must also release dispatch retries.
+	}
+	return err
+}
+
+func planDispatchComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, pjLister ctrlruntimeclient.Reader, mode scheduleMode, explicit bool) (string, []config.Presubmit, error) {
 	if pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) == 0 {
-		deleteIds()
-		return fmt.Errorf("ProwJob %s does not have valid Refs.Pulls", pj.Name)
+		return "", nil, fmt.Errorf("ProwJob %s does not have valid Refs.Pulls", pj.Name)
 	}
 
 	// Combine pipelineConditionallyRequired and pipelineSkipOnlyRequired for processing
 	allConditionalTests := append([]config.Presubmit{}, presubmits.pipelineConditionallyRequired...)
 	allConditionalTests = append(allConditionalTests, presubmits.pipelineSkipOnlyRequired...)
 
-	testContexts, err := acquireConditionalContexts(context.Background(), pj, allConditionalTests, ghc, deleteIds, pjLister, mode)
+	conditionalJobs, err := selectConditionalJobs(context.Background(), pj, allConditionalTests, ghc, pjLister, mode)
 	if err != nil {
 		// In modeDelta a list error fails closed: schedule nothing and post no
-		// comment. deleteIds() lets the automatic path retry on the next event
+		// comment. The caller lets the automatic path retry on the next event
 		// (and, because no comment is posted here, does not defeat the
 		// one-comment-per-SHA guarantee).
-		deleteIds()
-		return err
+		return "", nil, err
 	}
 
 	var comment string
@@ -78,13 +96,18 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 		// Skip re-triggering if a ProwJob already exists at the same SHA
 		// (unless this is an explicit /pipeline required command).
 		if mode == modeDelta && pjLister != nil && pj.Spec.Refs.Pulls[0].SHA != "" {
-			if existsAtSHA(context.Background(), pjLister, pj, presubmit.Name) {
+			exists, err := existsAtSHA(context.Background(), pjLister, pj, presubmit.Name)
+			if err != nil {
+				return "", nil, err
+			}
+			if exists {
 				continue
 			}
 		}
 		protectedJobs = append(protectedJobs, presubmit)
 	}
 	protectedCommands := testCommands(protectedJobs)
+	testContexts := testCommands(conditionalJobs)
 	if protectedCommands != "" {
 		comment += "Scheduling required tests:" + protectedCommands
 	}
@@ -101,9 +124,10 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 	// modeDelta the empty result can mean the second stage was already triggered
 	// earlier for this HEAD; in that case avoid the misleading "no second-stage
 	// tests were triggered" wording.
-	if comment == "" {
+	jobs := append(protectedJobs, conditionalJobs...)
+	if len(jobs) == 0 {
 		if !explicit {
-			return nil
+			return "", nil, nil
 		}
 		if mode == modeDelta && secondStageTriggeredAtSHA(context.Background(), pjLister, pj, presubmits) {
 			comment = fmt.Sprintf("**Pipeline controller notification**\n\nAll applicable second-stage tests for this HEAD have already been triggered. Nothing new to schedule.\n\nUse `/test ?` to see all available tests, or `/pipeline required` to re-run the full required set for the `%s` branch.", pj.Spec.Refs.BaseRef)
@@ -112,9 +136,19 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 		}
 	}
 
-	if err := ghc.CreateComment(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number, comment); err != nil {
-		deleteIds()
-		return err
+	return comment, jobs, nil
+}
+
+// Publish only the jobs being requested, before Hook can start them. Native
+// contexts must block merging while the dispatch check is already successful.
+func publishPendingContexts(gh minimalGhClient, org, repo, sha string, jobs []config.Presubmit) error {
+	for _, job := range jobs {
+		if job.SkipReport || job.Context == "" {
+			continue
+		}
+		if err := gh.CreateStatus(org, repo, sha, github.Status{Context: job.Context, State: "pending", Description: PipelinePendingMessage}); err != nil {
+			return fmt.Errorf("publishing pending context %q: %w", job.Context, err)
+		}
 	}
 	return nil
 }
@@ -192,9 +226,9 @@ func pipelineAnnotationMatches(p config.Presubmit, changes config.ChangedFilesPr
 	return shouldRun, err
 }
 
-func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineConditionallyRequired []config.Presubmit, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, mode scheduleMode) (string, error) {
+func selectConditionalJobs(ctx context.Context, pj *v1.ProwJob, pipelineConditionallyRequired []config.Presubmit, ghc minimalGhClient, pjLister ctrlruntimeclient.Reader, mode scheduleMode) ([]config.Presubmit, error) {
 	if pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) == 0 {
-		return "", fmt.Errorf("ProwJob %s does not have valid Refs.Pulls", pj.Name)
+		return nil, fmt.Errorf("ProwJob %s does not have valid Refs.Pulls", pj.Name)
 	}
 
 	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
@@ -211,8 +245,7 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 
 			shouldRun, err := pipelineAnnotationMatches(presubmit, cfp)
 			if err != nil {
-				deleteIds()
-				return "", err
+				return nil, err
 			}
 
 			if shouldRun {
@@ -244,7 +277,7 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 				// (that would mass-trigger). Return the error so sendCommentWithMode
 				// short-circuits and schedules nothing; the automatic path retries on
 				// the next ProwJob event.
-				return "", fmt.Errorf("listing prowjobs for delta: %w", err)
+				return nil, fmt.Errorf("listing prowjobs for delta: %w", err)
 			}
 			for _, pjob := range pjs.Items {
 				if pjob.Spec.Refs != nil && len(pjob.Spec.Refs.Pulls) > 0 &&
@@ -264,14 +297,14 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 			// else: already present at HEAD (manual trigger or a prior delta) → skip it
 		}
 	}
-	return testCommands(selected), nil
+	return selected, nil
 }
 
 // existsAtSHA checks whether a ProwJob with the given job name already exists
 // for the same org/repo/PR/baseRef at the same HEAD SHA. This is used to avoid
 // re-triggering tests that were already triggered (e.g. via /pipeline required)
 // when an event like /lgtm fires at the same commit.
-func existsAtSHA(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.ProwJob, jobName string) bool {
+func existsAtSHA(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.ProwJob, jobName string) (bool, error) {
 	selector := map[string]string{
 		kube.OrgLabel:         pj.Spec.Refs.Org,
 		kube.RepoLabel:        pj.Spec.Refs.Repo,
@@ -282,7 +315,7 @@ func existsAtSHA(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.
 
 	var pjs v1.ProwJobList
 	if err := pjLister.List(ctx, &pjs, ctrlruntimeclient.MatchingLabels(selector)); err != nil {
-		return false
+		return false, fmt.Errorf("listing prowjobs for delta: %w", err)
 	}
 
 	for _, pjob := range pjs.Items {
@@ -290,38 +323,24 @@ func existsAtSHA(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.
 			pjob.Spec.Refs != nil &&
 			len(pjob.Spec.Refs.Pulls) > 0 &&
 			pjob.Spec.Refs.Pulls[0].SHA == pj.Spec.Refs.Pulls[0].SHA {
-			return true
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func isFirstStageJob(presubmits presubmitTests, name string) bool {
+	for _, jobs := range [][]config.Presubmit{presubmits.alwaysRequired, presubmits.conditionallyRequired} {
+		for _, job := range jobs {
+			if job.Name == name {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-type firstStageSuccessWitness struct {
-	Context string `json:"context"`
-}
-
 // Both paths trust the latest matching ProwJob, including successful overrides.
-// Agentic callers retain successes for this HEAD/base after ProwJob cleanup.
-func firstStageJobPassed(job config.Presubmit, pj *v1.ProwJob, required bool, witnesses map[string]firstStageSuccessWitness) bool {
-	if pj == nil {
-		witness, seen := witnesses[job.Name]
-		return !required || (seen && witness.Context == job.Context)
-	}
-	if pj.Status.State != v1.SuccessState {
-		delete(witnesses, job.Name)
-		return false
-	}
-	if witnesses != nil {
-		witnesses[job.Name] = firstStageSuccessWitness{Context: job.Context}
-	}
-	return true
-}
-
-// checkFirstStageComplete checks if all first-stage tests have completed
-// successfully for the given ProwJob's SHA. This is used by the /pipeline auto
-// handler to trigger second-stage tests immediately when first-stage is already
-// done, since the event-driven reconciler won't fire if all ProwJob updates
-// occurred before the pipeline-auto label was added.
 func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {
 	if pj == nil || pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) != 1 {
 		return false, nil
@@ -357,22 +376,12 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 
 	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
 
-	// Second-stage (protected) jobs must not already be running
-	for _, presubmit := range presubmits.protected {
-		if !strings.Contains(presubmit.Name, repoBaseRef) {
-			continue
-		}
-		if _, ok := latestBatch[presubmit.Name]; ok {
-			return false, nil
-		}
-	}
-
 	// All always-required first-stage jobs must have succeeded
 	for _, presubmit := range presubmits.alwaysRequired {
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
-		if !firstStageJobPassed(presubmit, latestBatch[presubmit.Name], true, nil) {
+		if job := latestBatch[presubmit.Name]; job == nil || job.Status.State != v1.SuccessState {
 			return false, nil
 		}
 	}
@@ -382,7 +391,7 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
-		if !firstStageJobPassed(presubmit, latestBatch[presubmit.Name], false, nil) {
+		if job := latestBatch[presubmit.Name]; job != nil && job.Status.State != v1.SuccessState {
 			return false, nil
 		}
 	}

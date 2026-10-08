@@ -8,31 +8,16 @@ import (
 	"sigs.k8s.io/prow/pkg/github"
 )
 
-// Queue keys are PRs. sha is used only by the local store's ownership index.
 type agenticWork struct {
 	org, repo string
 	number    int
-	sha       string
 }
 
 type agenticInput struct {
 	generation uint64
 	comments   []github.IssueComment
-}
-
-type agenticPlanPendingError struct{ error }
-
-func (a *agenticController) startQueue(ctx context.Context) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.queueMu.Lock()
-	a.queueCtx = ctx
-	a.queue = workqueue.NewTypedRateLimitingQueue(workqueue.NewTypedItemExponentialFailureRateLimiter[agenticWork](5*time.Second, 5*time.Minute))
-	for work := range a.inputs {
-		a.queue.Add(work)
-	}
-	a.queueMu.Unlock()
-	a.startStateMaintenanceLocked()
+	retries    int
+	retryAt    time.Time
 }
 
 func (a *agenticController) enqueue(org, repo string, number int, comment *github.IssueComment) {
@@ -55,8 +40,8 @@ func (a *agenticController) enqueue(org, repo string, number int, comment *githu
 	input.generation++
 	if comment != nil {
 		duplicate := false
-		for _, pending := range input.comments {
-			duplicate = duplicate || pending.ID == comment.ID
+		for _, queued := range input.comments {
+			duplicate = duplicate || queued.ID == comment.ID
 		}
 		if !duplicate {
 			input.comments = append(input.comments, *comment)
@@ -67,141 +52,108 @@ func (a *agenticController) enqueue(org, repo string, number int, comment *githu
 	}
 }
 
-func agenticUnfinished(r *agenticRecord) bool {
-	s := r.State
-	return r.Dirty || (!s.Inactive && (s.PendingDispatch || s.RevisionPending ||
-		(s.Command != nil && !s.Command.Applied) || (s.Review != nil && !s.ReviewPosted && s.ActivatedAt != nil)))
-}
-
-// Caller holds queueMu. Concurrent events cannot shorten a server cooldown.
-func (a *agenticController) rememberCooldownLocked(work agenticWork, after time.Duration) {
-	if a.retryAt == nil {
-		a.retryAt = map[agenticWork]time.Time{}
-	}
-	if at := a.currentTime().Add(after); at.After(a.retryAt[work]) {
-		a.retryAt[work] = at
-	}
-}
-
 func (a *agenticController) processNext(ctx context.Context) bool {
-	q := a.queue
-	work, shutdown := q.Get()
+	work, shutdown := a.queue.Get()
 	if shutdown {
 		return false
 	}
-	defer q.Done(work)
+	defer a.queue.Done(work)
 	a.queueMu.Lock()
 	input := a.inputs[work]
 	var generation uint64
 	var comment *github.IssueComment
 	if input != nil {
+		if input.retryAt.After(a.currentTime()) {
+			a.queue.AddAfter(work, input.retryAt.Sub(a.currentTime()))
+			a.queueMu.Unlock()
+			return true
+		}
 		generation = input.generation
-		if len(input.comments) > 0 {
+		if len(input.comments) != 0 {
 			copy := input.comments[0]
 			comment = &copy
 		}
 	}
-	if at := a.retryAt[work]; at.After(a.currentTime()) {
-		q.AddAfter(work, at.Sub(a.currentTime()))
-		a.queueMu.Unlock()
-		return true
-	}
 	a.queueMu.Unlock()
 	a.mu.Lock()
-	var deadline time.Time
-	var err error
-	if a.stopped || ctx.Err() != nil {
-		a.mu.Unlock()
-		return false
-	}
-	// Delayed queue items cannot be cancelled. A stale deadline is a local
-	// read only, not another GitHub reconciliation of an idle/completed PR.
 	if input == nil {
-		var r *agenticRecord
-		r, err = a.readRecord(ctx, work)
-		if err == nil && (r == nil || (!agenticUnfinished(r) && r.State.WaitingSince == nil)) {
-			q.Forget(work)
+		s := a.states[work]
+		if s == nil || s.waitingUntil.IsZero() {
+			a.mu.Unlock()
+			return true // A cancelled/stale deadline makes no GitHub calls.
+		}
+		if s.waitingUntil.After(a.currentTime()) {
+			a.queue.AddAfter(work, s.waitingUntil.Sub(a.currentTime()))
 			a.mu.Unlock()
 			return true
 		}
-		if err == nil && !agenticUnfinished(r) && r.State.WaitingSince != nil {
-			at := r.State.WaitingSince.Add(a.options.timeout)
-			if at.After(a.currentTime()) {
-				q.AddAfter(work, at.Sub(a.currentTime()))
-				a.mu.Unlock()
-				return true
-			}
-		}
 	}
-	if err == nil {
-		err = a.reconcilePull(ctx, work.org, work.repo, work.number, comment, &deadline)
+	err := a.reconcilePull(ctx, work, comment)
+	var deadline time.Time
+	if s := a.states[work]; s != nil {
+		deadline = s.waitingUntil
 	}
 	a.mu.Unlock()
 	a.queueMu.Lock()
 	defer a.queueMu.Unlock()
+	input = a.inputs[work]
 	retry := agenticRetryFor(err)
-	if retry.transient {
-		// Keep the event/command across live retries, but do not journal timers.
+	if retry.transient && (input == nil || input.retries < 5) {
 		if a.inputs == nil {
 			a.inputs = map[agenticWork]*agenticInput{}
 		}
-		if a.inputs[work] == nil {
-			a.inputs[work] = &agenticInput{}
+		if input == nil {
+			input = &agenticInput{}
+			a.inputs[work] = input
 		}
+		input.retries++
 		if retry.after > 0 {
-			a.rememberCooldownLocked(work, retry.after)
-			q.AddAfter(work, a.retryAt[work].Sub(a.currentTime()))
+			input.retryAt = a.currentTime().Add(retry.after)
+			a.queue.AddAfter(work, retry.after)
 		} else {
-			q.AddRateLimited(work)
+			a.queue.AddRateLimited(work)
 		}
 		return true
 	}
-	if !a.retryAt[work].After(a.currentTime()) {
-		delete(a.retryAt, work)
-	}
-	q.Forget(work)
-	if current := a.inputs[work]; current != nil {
-		if comment != nil && len(current.comments) > 0 && current.comments[0].ID == comment.ID {
-			current.comments = current.comments[1:]
+	a.queue.Forget(work)
+	if input != nil {
+		input.retries, input.retryAt = 0, time.Time{}
+		if comment != nil && len(input.comments) != 0 && input.comments[0].ID == comment.ID {
+			input.comments = input.comments[1:]
 		}
-		if len(current.comments) == 0 && current.generation == generation {
+		if len(input.comments) == 0 && input.generation == generation {
 			delete(a.inputs, work)
 		} else {
-			q.Add(work)
+			a.queue.Add(work)
 		}
 	}
-	if !deadline.IsZero() {
-		q.AddAfter(work, max(deadline.Sub(a.currentTime()), 0))
+	if err == nil && !deadline.IsZero() {
+		a.queue.AddAfter(work, max(deadline.Sub(a.currentTime()), 0))
 	}
 	if err != nil {
-		a.logger.WithError(err).WithField("pr", work.number).Warn("Agentic reconciliation awaits its deadline or a relevant event")
+		a.logger.WithError(err).WithField("pr", work.number).Warn("Pipeline handoff failed; waiting for another relevant event")
 	}
 	return true
 }
 
-func (a *agenticController) restoreRecords(ctx context.Context) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.prepareStoreLocked(); err != nil {
-		return err
+func (a *agenticController) Run(ctx context.Context) error {
+	a.queueMu.Lock()
+	a.queue = workqueue.NewTypedRateLimitingQueue(workqueue.NewTypedItemExponentialFailureRateLimiter[agenticWork](5*time.Second, 5*time.Minute))
+	for work := range a.inputs {
+		a.queue.Add(work)
 	}
-	if a.store == nil || a.dryRun {
-		return nil
-	}
-	for _, name := range a.store.recordNames() {
-		r, err := a.readStoredRecord(ctx, name)
-		if err != nil {
-			return err
+	a.queueMu.Unlock()
+	defer a.queue.ShutDown()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			a.queue.ShutDown()
+		case <-done:
 		}
-		if r == nil {
-			continue
-		}
-		work := agenticWork{org: r.State.Org, repo: r.State.Repo, number: r.State.Number}
-		if agenticUnfinished(r) {
-			a.queue.Add(work)
-		} else if r.State.WaitingSince != nil {
-			a.queue.AddAfter(work, max(r.State.WaitingSince.Add(a.options.timeout).Sub(a.currentTime()), 0))
-		}
+	}()
+	for a.processNext(ctx) {
 	}
 	return nil
 }

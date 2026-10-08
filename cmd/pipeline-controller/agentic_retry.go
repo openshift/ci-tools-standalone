@@ -20,13 +20,9 @@ type agenticRetryInfo struct {
 }
 
 // Only recognizable operational failures retry without a new event. Inspect
-// every wrapped cause: recording a terminal validation failure can itself fail
-// transiently, and that failed write still needs recovery.
+// every wrapped cause, including joined errors from failed API writes.
 func agenticRetryFor(err error) agenticRetryInfo {
 	if err == nil {
-		return agenticRetryInfo{}
-	}
-	if _, pending := err.(agenticPlanPendingError); pending {
 		return agenticRetryInfo{}
 	}
 	var result agenticRetryInfo
