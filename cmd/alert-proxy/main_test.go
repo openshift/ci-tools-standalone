@@ -16,14 +16,13 @@ func TestAlertmanagerURLValidation(t *testing.T) {
 		value   string
 		wantErr bool
 	}{
-		{name: "service", value: "https://alertmanager-user-workload.openshift-user-workload-monitoring.svc:9095"},
-		{name: "fully qualified service", value: "https://alertmanager-user-workload.openshift-user-workload-monitoring.svc.cluster.local:9095/"},
+		{name: "service", value: "http://alertmanager-operated.ci-monitoring.svc:9093"},
+		{name: "fully qualified service", value: "http://alertmanager-operated.ci-monitoring.svc.cluster.local:9093/"},
 		{name: "relative", value: "/api/v2", wantErr: true},
-		{name: "HTTP", value: "http://alertmanager-user-workload.openshift-user-workload-monitoring.svc:9095", wantErr: true},
-		{name: "external host", value: "https://" + marker + ".example:9095", wantErr: true},
-		{name: "wrong port", value: "https://alertmanager-user-workload.openshift-user-workload-monitoring.svc:9443", wantErr: true},
-		{name: "path", value: "https://alertmanager-user-workload.openshift-user-workload-monitoring.svc:9095/" + marker, wantErr: true},
-		{name: "credentials and query", value: "https://user:" + marker + "@example.invalid:9095?token=" + marker, wantErr: true},
+		{name: "external host", value: "http://" + marker + ".example:9093", wantErr: true},
+		{name: "wrong port", value: "http://alertmanager-operated.ci-monitoring.svc:9443", wantErr: true},
+		{name: "path", value: "http://alertmanager-operated.ci-monitoring.svc.cluster.local:9093/" + marker, wantErr: true},
+		{name: "credentials and query", value: "http://user:" + marker + "@example.invalid:9093?token=" + marker, wantErr: true},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {

@@ -41,9 +41,9 @@ type options struct {
 }
 
 const (
-	alertmanagerServiceHost               = "alertmanager-user-workload.openshift-user-workload-monitoring.svc"
-	alertmanagerServiceFullyQualifiedHost = "alertmanager-user-workload.openshift-user-workload-monitoring.svc.cluster.local"
-	alertmanagerServicePort               = "9095"
+	alertmanagerServiceHost               = "alertmanager-operated.ci-monitoring.svc"
+	alertmanagerServiceFullyQualifiedHost = "alertmanager-operated.ci-monitoring.svc.cluster.local"
+	alertmanagerServicePort               = "9093"
 )
 
 func gatherOptions(args []string) (options, error) {
@@ -80,9 +80,6 @@ func validateAlertmanagerURL(value string) error {
 	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return errors.New("must not contain user information, a query, or a fragment")
-	}
-	if parsed.Scheme != "https" {
-		return errors.New("scheme must be HTTPS")
 	}
 	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
 	if host != alertmanagerServiceHost && host != alertmanagerServiceFullyQualifiedHost {
