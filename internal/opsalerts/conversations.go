@@ -24,6 +24,8 @@ import (
 // ConversationMetadataEvent separates chat requests from workflow receipts.
 const ConversationMetadataEvent = "ops_dashboard_conversation_v1"
 
+const conversationFooter = "\n\n💬 Dashboard · Chai"
+
 // ConversationRequest binds a stable delivery key to one operator question.
 type ConversationRequest struct {
 	ConversationID string `json:"conversation_id,omitempty"`
@@ -125,7 +127,7 @@ func (s *Service) decodeConversation(message slack.Message) (conversationRecord,
 	}
 	text, found := strings.CutPrefix(message.Text, "<@"+record.ChaiUser+"> ")
 	if record.Root == "" {
-		text, found = strings.CutSuffix(text, "\n\n💬 Dashboard · Chai")
+		text, found = trimConversationFooter(text)
 		found = found && strings.HasPrefix(message.Text, "<@"+record.ChaiUser+"> ")
 	}
 	record.Request.Text = html.UnescapeString(text)
@@ -161,6 +163,17 @@ func (s *Service) decodeConversation(message slack.Message) (conversationRecord,
 	return record, nil
 }
 
+// trimConversationFooter accepts the posted footer and Slack's emoji alias
+// representation, leaving the operator's question unchanged for hash validation.
+func trimConversationFooter(text string) (string, bool) {
+	for _, footer := range []string{conversationFooter, "\n\n:speech_balloon: Dashboard · Chai"} {
+		if question, found := strings.CutSuffix(text, footer); found {
+			return question, true
+		}
+	}
+	return text, false
+}
+
 // conversationCandidate preserves recovery evidence even when chat metadata is unreadable.
 // Workflow receipt surfaces take precedence over mention-only chat recognition.
 func (s *Service) conversationCandidate(m slack.Message) bool {
@@ -175,7 +188,8 @@ func (s *Service) conversationCandidate(m slack.Message) bool {
 	if m.Metadata.EventType != ConversationMetadataEvent && strings.Contains(m.Text, "\n"+ActionMarker) {
 		return false
 	}
-	return m.Metadata.EventType == ConversationMetadataEvent || strings.HasSuffix(m.Text, "\n\n💬 Dashboard · Chai") || regexp.MustCompile(`^<@[A-Za-z0-9_]{1,128}> `).MatchString(m.Text)
+	_, footer := trimConversationFooter(m.Text)
+	return m.Metadata.EventType == ConversationMetadataEvent || footer || regexp.MustCompile(`^<@[A-Za-z0-9_]{1,128}> `).MatchString(m.Text)
 }
 
 // conversationRoot retains candidate standalone chats independently of decoding health.
@@ -407,7 +421,7 @@ func (s *Service) conversationMessage(record conversationRecord) (slack.Msg, err
 	}
 	text := "<@" + record.ChaiUser + "> " + escapeSlack(record.Request.Text)
 	if record.Root == "" {
-		text += "\n\n💬 Dashboard · Chai"
+		text += conversationFooter
 	}
 	message := slack.Msg{Text: text, Metadata: slack.SlackMetadata{EventType: ConversationMetadataEvent, EventPayload: map[string]interface{}{"record": string(data)}}}
 	envelope, err := json.Marshal(message.Metadata)
