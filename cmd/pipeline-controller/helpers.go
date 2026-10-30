@@ -86,11 +86,9 @@ func planDispatchComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 
 	var comment string
 
-	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
-
 	var protectedJobs []config.Presubmit
 	for _, presubmit := range presubmits.protected {
-		if !strings.Contains(presubmit.Name, repoBaseRef) {
+		if !presubmit.CouldRun(pj.Spec.Refs.BaseRef) {
 			continue
 		}
 		// Skip re-triggering if a ProwJob already exists at the same SHA
@@ -192,12 +190,11 @@ func secondStageTriggeredAtSHA(ctx context.Context, pjLister ctrlruntimeclient.R
 		}
 	}
 
-	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
 	secondStage := append([]config.Presubmit{}, presubmits.protected...)
 	secondStage = append(secondStage, presubmits.pipelineConditionallyRequired...)
 	secondStage = append(secondStage, presubmits.pipelineSkipOnlyRequired...)
 	for _, presubmit := range secondStage {
-		if !strings.Contains(presubmit.Name, repoBaseRef) {
+		if !presubmit.CouldRun(pj.Spec.Refs.BaseRef) {
 			continue
 		}
 		if existing[presubmit.Name] {
@@ -231,7 +228,6 @@ func selectConditionalJobs(ctx context.Context, pj *v1.ProwJob, pipelineConditio
 		return nil, fmt.Errorf("ProwJob %s does not have valid Refs.Pulls", pj.Name)
 	}
 
-	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
 	var selected []config.Presubmit
 	if len(pipelineConditionallyRequired) != 0 {
 		cfp := config.NewGitHubDeferredChangedFilesProvider(ghc, pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number)
@@ -239,7 +235,7 @@ func selectConditionalJobs(ctx context.Context, pj *v1.ProwJob, pipelineConditio
 		// First, determine which tests should run based on file changes
 		var testsToRun []config.Presubmit
 		for _, presubmit := range pipelineConditionallyRequired {
-			if !strings.Contains(presubmit.Name, repoBaseRef) {
+			if !presubmit.CouldRun(pj.Spec.Refs.BaseRef) {
 				continue
 			}
 
@@ -288,7 +284,7 @@ func selectConditionalJobs(ctx context.Context, pj *v1.ProwJob, pipelineConditio
 		}
 
 		for _, presubmit := range testsToRun {
-			if !strings.Contains(presubmit.Name, repoBaseRef) {
+			if !presubmit.CouldRun(pj.Spec.Refs.BaseRef) {
 				continue
 			}
 			if mode == modeForce || !existing[presubmit.Name] {
@@ -374,11 +370,9 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 		}
 	}
 
-	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
-
 	// All always-required first-stage jobs must have succeeded
 	for _, presubmit := range presubmits.alwaysRequired {
-		if !strings.Contains(presubmit.Name, repoBaseRef) {
+		if !presubmit.CouldRun(pj.Spec.Refs.BaseRef) {
 			continue
 		}
 		if job := latestBatch[presubmit.Name]; job == nil || job.Status.State != v1.SuccessState {
@@ -388,7 +382,7 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 
 	// Conditionally-required first-stage jobs, if present, must have succeeded
 	for _, presubmit := range presubmits.conditionallyRequired {
-		if !strings.Contains(presubmit.Name, repoBaseRef) {
+		if !presubmit.CouldRun(pj.Spec.Refs.BaseRef) {
 			continue
 		}
 		if job := latestBatch[presubmit.Name]; job != nil && job.Status.State != v1.SuccessState {

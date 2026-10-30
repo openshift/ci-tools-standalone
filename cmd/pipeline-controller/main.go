@@ -7,7 +7,6 @@ import (
 	"os"
 	"regexp"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -689,12 +688,11 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 		filenames = append(filenames, change.Filename)
 	}
 
-	// Filter tests by branch - only process tests that match the target branch
-	repoBaseRef := repo + "-" + baseBranch
+	// Filter tests by their configured branch rules, not by branch-name prefixes.
 
 	// Evaluate pipeline_run_if_changed tests
 	for _, presubmit := range presubmits.pipelineConditionallyRequired {
-		if !strings.Contains(presubmit.Name, repoBaseRef) {
+		if presubmit.SkipReport || !presubmit.CouldRun(baseBranch) {
 			continue
 		}
 		if pattern, ok := presubmit.Annotations["pipeline_run_if_changed"]; ok && pattern != "" {
@@ -713,7 +711,7 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 
 	// Evaluate pipeline_skip_if_only_changed tests
 	for _, presubmit := range presubmits.pipelineSkipOnlyRequired {
-		if !strings.Contains(presubmit.Name, repoBaseRef) {
+		if presubmit.SkipReport || !presubmit.CouldRun(baseBranch) {
 			continue
 		}
 		if pattern, ok := presubmit.Annotations["pipeline_skip_if_only_changed"]; ok && pattern != "" {
@@ -733,7 +731,7 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 
 	// Create contexts for protected jobs (always_run: false, optional: false, no run conditions)
 	for _, presubmit := range presubmits.protected {
-		if !strings.Contains(presubmit.Name, repoBaseRef) {
+		if presubmit.SkipReport || !presubmit.CouldRun(baseBranch) {
 			continue
 		}
 		if err := cw.createContext(org, repo, sha, presubmit.Context, "pending", PipelinePendingMessage); err != nil {
