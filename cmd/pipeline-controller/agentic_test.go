@@ -178,8 +178,8 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 		Head: github.PullRequestBranch{SHA: strings.Repeat("a", 40)},
 		Base: github.PullRequestBranch{Ref: "main", Repo: github.Repo{Name: "repo", Owner: github.User{Login: "org"}}}}}
 	static := []config.Presubmit{
-		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-unit"}, AlwaysRun: true, Reporter: config.Reporter{Context: "ci/unit"}},
-		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-e2e"}, Reporter: config.Reporter{Context: "ci/e2e"}, RerunCommand: "/test e2e"},
+		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-unit"}, Brancher: config.Brancher{Branches: []string{"^main$"}}, AlwaysRun: true, Reporter: config.Reporter{Context: "ci/unit"}},
+		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-e2e"}, Brancher: config.Brancher{Branches: []string{"^main$"}}, Reporter: config.Reporter{Context: "ci/e2e"}, RerunCommand: "/test e2e"},
 	}
 	f.cfg = &config.Config{}
 	require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}))
@@ -1279,7 +1279,13 @@ func TestAgenticRetargetInvalidatesCompletionBeforeReadiness(t *testing.T) {
 	f := newAgenticFixture(t, "auto")
 	f.a.watcher.config.Orgs[0].Repos[0].Branches = []string{"main", "release"}
 	presubmits := f.a.configDataProvider.updatedPresubmits["org/repo"]
-	presubmits.alwaysRequired = append(presubmits.alwaysRequired, config.Presubmit{JobBase: config.JobBase{Name: "pull-ci-org-repo-release-unit"}, AlwaysRun: true})
+	releaseUnit := []config.Presubmit{{
+		JobBase:   config.JobBase{Name: "pull-ci-org-repo-release-unit"},
+		Brancher:  config.Brancher{Branches: []string{"^release$"}},
+		AlwaysRun: true,
+	}}
+	require.NoError(t, config.SetPresubmitRegexes(releaseUnit))
+	presubmits.alwaysRequired = append(presubmits.alwaysRequired, releaseUnit[0])
 	f.a.configDataProvider.updatedPresubmits["org/repo"] = presubmits
 	f.passFirstStage()
 	f.reconcile(t, nil)
