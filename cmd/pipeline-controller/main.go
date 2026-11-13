@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
+	"sigs.k8s.io/prow/pkg/config"
 	"sigs.k8s.io/prow/pkg/config/secret"
 	prowflagutil "sigs.k8s.io/prow/pkg/flagutil"
 	configflagutil "sigs.k8s.io/prow/pkg/flagutil/config"
@@ -533,7 +534,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 				},
 			}
 			var err error
-			firstStageComplete, err = checkFirstStageComplete(context.Background(), cw.pjLister, prowJob, presubmits)
+			firstStageComplete, err = checkFirstStageComplete(context.Background(), cw.pjLister, cw.ghc, prowJob, presubmits)
 			if err != nil {
 				logger.WithError(err).Error("failed to check first-stage test status")
 			}
@@ -670,8 +671,8 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 		"pr":   number,
 		"sha":  sha,
 	})
+	refs := &v1.Refs{Org: org, Repo: repo, BaseRef: baseBranch, Pulls: []v1.Pull{{Number: number, SHA: sha}}}
 	if sha != "" && pipelineGateTriggerSatisfied(trigger, &event.PullRequest) {
-		refs := &v1.Refs{Org: org, Repo: repo, BaseRef: baseBranch, Pulls: []v1.Pull{{Number: number, SHA: sha}}}
 		if err := cw.checks.pending(refs); err != nil {
 			logger.WithError(err).Error("failed to create pipeline dispatch check")
 		}
@@ -692,6 +693,12 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 	// Filter tests by branch - only process tests that match the target branch
 	repoBaseRef := repo + "-" + baseBranch
 
+	// Collect the selected tests first; their pending contexts are published
+	// only after the terminal-results check below, so a reopened PR or a
+	// controller restart cannot overwrite a finished context with a fresh
+	// pending placeholder.
+	var selected []config.Presubmit
+
 	// Evaluate pipeline_run_if_changed tests
 	for _, presubmit := range presubmits.pipelineConditionallyRequired {
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
@@ -702,11 +709,7 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 				logger.WithError(err).WithField("test", presubmit.Name).WithField("pattern", pattern).Error("failed to evaluate pattern")
 				continue
 			} else if shouldRun {
-				if err := cw.createContext(org, repo, sha, presubmit.Context, "pending", PipelinePendingMessage); err != nil {
-					logger.WithError(err).WithField("test", presubmit.Name).Error("failed to create context")
-				} else {
-					logger.WithField("test", presubmit.Name).Info("created pending context for pipeline test")
-				}
+				selected = append(selected, presubmit)
 			}
 		}
 	}
@@ -722,11 +725,7 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 				continue
 			} else if !shouldSkip {
 				// If not all files match the skip pattern, we should run the test
-				if err := cw.createContext(org, repo, sha, presubmit.Context, "pending", PipelinePendingMessage); err != nil {
-					logger.WithError(err).WithField("test", presubmit.Name).Error("failed to create context")
-				} else {
-					logger.WithField("test", presubmit.Name).Info("created pending context for pipeline test")
-				}
+				selected = append(selected, presubmit)
 			}
 		}
 	}
@@ -736,11 +735,26 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
+		selected = append(selected, presubmit)
+	}
+
+	// Jobs whose contexts already hold a terminal GitHub result on this exact
+	// HEAD (their ProwJobs may have been pruned by sinker) keep that result.
+	// When the verification fails, pending placeholders are published for
+	// every selected job anyway: an unknown history must keep blocking
+	// merges, and the pipeline gate is either absent (token auth) or already
+	// preserved green by checks.pending, so only these contexts hold the PR.
+	proven, err := terminalReportedContexts(cw.ghc, refs, presubmits.statusContextOwners, selected)
+	if err != nil {
+		logger.WithError(err).Error("failed to verify terminal job contexts")
+	}
+
+	for _, presubmit := range withoutReportedJobs(selected, proven, baseBranch, presubmits.statusContextOwners) {
 		if err := cw.createContext(org, repo, sha, presubmit.Context, "pending", PipelinePendingMessage); err != nil {
 			logger.WithError(err).WithField("test", presubmit.Name).Error("failed to create context")
-		} else {
-			logger.WithField("test", presubmit.Name).Info("created pending context for protected test")
+			continue
 		}
+		logger.WithField("test", presubmit.Name).Info("created pending context for pipeline test")
 	}
 }
 

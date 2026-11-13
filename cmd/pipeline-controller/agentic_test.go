@@ -42,6 +42,8 @@ type fakeAgenticGitHub struct {
 	checkAttempts         int
 	getPullRequestCalls   int
 	getPullRequestError   error
+	combinedStatus        *github.CombinedStatus
+	statusReads           int
 	beforeComment         func(string)
 	afterCheckWrite       func(github.CheckRun)
 }
@@ -98,6 +100,17 @@ func (f *fakeAgenticGitHub) RemoveLabel(_, _ string, _ int, label string) error 
 func (f *fakeAgenticGitHub) GetIssueLabels(_, _ string, _ int) ([]github.Label, error) {
 	return f.pr.Labels, nil
 }
+
+// GetCombinedStatus reports no statuses for the requested SHA by default, so
+// pruned-job verification fails closed in tests that do not stub statuses.
+func (f *fakeAgenticGitHub) GetCombinedStatus(_, _, sha string) (*github.CombinedStatus, error) {
+	f.statusReads++
+	if f.combinedStatus != nil {
+		return f.combinedStatus, nil
+	}
+	return &github.CombinedStatus{SHA: sha}, nil
+}
+
 func (f *fakeAgenticGitHub) ListCheckRuns(_, _, sha string) (*github.CheckRunList, error) {
 	result := &github.CheckRunList{}
 	for _, check := range f.checks {
@@ -178,8 +191,13 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 		Head: github.PullRequestBranch{SHA: strings.Repeat("a", 40)},
 		Base: github.PullRequestBranch{Ref: "main", Repo: github.Repo{Name: "repo", Owner: github.User{Login: "org"}}}}}
 	static := []config.Presubmit{
-		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-unit"}, AlwaysRun: true, Reporter: config.Reporter{Context: "ci/unit"}},
-		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-e2e"}, Reporter: config.Reporter{Context: "ci/e2e"}, RerunCommand: "/test e2e"},
+		// The canonical single-base brancher keeps these jobs eligible for
+		// the commit-status fallbacks, which attribute a context to a job
+		// only when it runs on exactly one base branch.
+		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-unit"},
+			Brancher: config.Brancher{Branches: []string{"^main$"}}, AlwaysRun: true, Reporter: config.Reporter{Context: "ci/unit"}},
+		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-e2e"},
+			Brancher: config.Brancher{Branches: []string{"^main$"}}, Reporter: config.Reporter{Context: "ci/e2e"}, RerunCommand: "/test e2e"},
 	}
 	f.cfg = &config.Config{}
 	require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}))
@@ -612,10 +630,29 @@ func TestAgenticChaiCommentResponse(t *testing.T) {
 }
 
 func TestAgenticResponseTimeoutUsesTraditionalTrigger(t *testing.T) {
-	for _, mode := range []string{"auto", "manual", "lgtm", "lgtm-approved"} {
-		t.Run(mode, func(t *testing.T) {
-			trigger := strings.TrimSuffix(mode, "-approved")
+	for _, tc := range []struct {
+		mode   string
+		pruned bool
+	}{
+		{mode: "auto"},
+		{mode: "manual"},
+		{mode: "lgtm"},
+		{mode: "lgtm-approved"},
+		{mode: "auto", pruned: true},
+	} {
+		name := tc.mode
+		if tc.pruned {
+			name += "-pruned"
+		}
+		t.Run(name, func(t *testing.T) {
+			trigger := strings.TrimSuffix(tc.mode, "-approved")
 			f := newAgenticFixture(t, trigger)
+			if tc.pruned {
+				// Sinker pruned the finished second-stage ProwJob; only its
+				// terminal commit status remains.
+				f.gh.combinedStatus = &github.CombinedStatus{SHA: f.gh.pr.Head.SHA, Statuses: []github.Status{
+					{Context: "ci/e2e", State: github.StatusSuccess}}}
+			}
 			if trigger == "lgtm" {
 				f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
 			}
@@ -625,7 +662,7 @@ func TestAgenticResponseTimeoutUsesTraditionalTrigger(t *testing.T) {
 			}
 			f.reconcile(t, nil)
 			f.now = f.state().waitingUntil
-			if mode == "lgtm" {
+			if tc.mode == "lgtm" {
 				f.gh.pr.Labels = nil // Fallback must wait if approval was removed after handoff.
 			}
 			f.gh.beforeComment = func(body string) {
@@ -636,7 +673,13 @@ func TestAgenticResponseTimeoutUsesTraditionalTrigger(t *testing.T) {
 			}
 			f.reconcile(t, nil)
 			require.True(t, f.state().timedOut)
-			if mode == "auto" || mode == "lgtm-approved" {
+			if tc.pruned {
+				require.True(t, f.state().dispatched)
+				require.Equal(t, "success", f.gh.checks[0].Conclusion)
+				require.Empty(t, f.gh.comments, "terminal results must not be re-fired by the fallback")
+				require.Zero(t, f.gh.statusWrites, "proven contexts must not be reset to pending")
+				require.Equal(t, 1, f.gh.statusReads, "the proof costs one batched status read")
+			} else if tc.mode == "auto" || tc.mode == "lgtm-approved" {
 				require.Len(t, f.gh.comments, 1)
 				require.Contains(t, f.gh.comments[0].Body, "/test e2e")
 				require.Equal(t, "success", f.gh.checks[0].Conclusion)
@@ -645,7 +688,7 @@ func TestAgenticResponseTimeoutUsesTraditionalTrigger(t *testing.T) {
 			} else {
 				require.Empty(t, f.gh.comments)
 				require.Equal(t, "queued", f.gh.checks[0].Status)
-				if mode == "lgtm" {
+				if tc.mode == "lgtm" {
 					f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
 					f.reconcile(t, nil)
 					require.Equal(t, "success", f.gh.checks[0].Conclusion)

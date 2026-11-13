@@ -275,7 +275,7 @@ func (r *reconciler) reconcile(ctx context.Context, req reconcile.Request) error
 }
 
 func (r *reconciler) reportSuccessOnPR(ctx context.Context, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {
-	complete, err := checkFirstStageComplete(ctx, r.lister, pj, presubmits)
+	complete, err := checkFirstStageComplete(ctx, r.lister, r.ghc, pj, presubmits)
 	if err != nil || !complete {
 		return false, err
 	}

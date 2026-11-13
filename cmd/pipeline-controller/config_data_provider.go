@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,9 @@ type presubmitTests struct {
 	conditionallyRequired         []config.Presubmit
 	pipelineConditionallyRequired []config.Presubmit
 	pipelineSkipOnlyRequired      []config.Presubmit
+	// statusContextOwners maps case-folded contexts to sole static presubmit
+	// owners. Empty values mark ambiguous ownership; nil means unknown inventory.
+	statusContextOwners map[string]string
 }
 
 type ConfigDataProvider struct {
@@ -76,6 +80,36 @@ func (c *ConfigDataProvider) gatherDataForRepos(orgRepos []string) {
 		}
 		presubmits := cfg.GetPresubmitsStatic(orgRepo)
 
+		// Include reportable definitions outside the scheduling buckets too.
+		// Duplicate and postsubmit contexts are ambiguous; in-repo config
+		// makes this static inventory incomplete.
+		var statusContextOwners map[string]string
+		if !cfg.InRepoConfigEnabled(orgRepo) {
+			for _, p := range presubmits {
+				if p.SkipReport || p.Context == "" {
+					continue
+				}
+				if statusContextOwners == nil {
+					statusContextOwners = map[string]string{}
+				}
+				contextKey := strings.ToLower(p.Context)
+				if _, claimed := statusContextOwners[contextKey]; claimed {
+					statusContextOwners[contextKey] = "" // a second definition makes ownership ambiguous
+				} else {
+					statusContextOwners[contextKey] = p.Name
+				}
+			}
+			for _, p := range cfg.GetPostsubmitsStatic(orgRepo) {
+				if p.SkipReport || p.Context == "" {
+					continue
+				}
+				contextKey := strings.ToLower(p.Context)
+				if _, claimed := statusContextOwners[contextKey]; claimed {
+					statusContextOwners[contextKey] = "" // postsubmits report the same contexts on base branches
+				}
+			}
+		}
+
 		for _, p := range presubmits {
 			if !p.AlwaysRun && p.RunIfChanged == "" && p.SkipIfOnlyChanged == "" {
 				if val, ok := p.Annotations["pipeline_run_if_changed"]; ok && val != "" {
@@ -114,6 +148,14 @@ func (c *ConfigDataProvider) gatherDataForRepos(orgRepos []string) {
 				updatedPresubmits[orgRepo] = pre
 				continue
 			}
+		}
+
+		// Keep the inventory next to the buckets; nil stays nil so an unknown
+		// inventory stays distinguishable from a repo without reportable jobs.
+		if statusContextOwners != nil {
+			pre := updatedPresubmits[orgRepo]
+			pre.statusContextOwners = statusContextOwners
+			updatedPresubmits[orgRepo] = pre
 		}
 	}
 

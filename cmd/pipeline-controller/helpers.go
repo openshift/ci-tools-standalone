@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/util/sets"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/config"
@@ -31,6 +33,7 @@ type minimalGhClient interface {
 	CreateStatus(org, repo, ref string, s github.Status) error
 	AddLabel(org, repo string, number int, label string) error
 	GetIssueLabels(org, repo string, number int) ([]github.Label, error)
+	GetCombinedStatus(org, repo, ref string) (*github.CombinedStatus, error)
 }
 
 // sendCommentWithMode plans and posts the second-stage scheduling comment.
@@ -106,6 +109,23 @@ func planDispatchComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 		}
 		protectedJobs = append(protectedJobs, presubmit)
 	}
+
+	// Sinker may have pruned the finished second-stage ProwJobs, so the
+	// cache-only dedupe above can re-fire jobs that already completed at this
+	// HEAD: one batched status lookup recovers those runs, failing closed like
+	// the lister errors above. modeForce never consults statuses.
+	proven := sets.New[string]()
+	if mode == modeDelta && pjLister != nil && pj.Spec.Refs.Pulls[0].SHA != "" {
+		proven, err = terminalReportedContexts(ghc, pj.Spec.Refs, presubmits.statusContextOwners, append(protectedJobs, conditionalJobs...))
+		if err != nil {
+			return "", nil, err
+		}
+		if proven.Len() > 0 {
+			protectedJobs = withoutReportedJobs(protectedJobs, proven, pj.Spec.Refs.BaseRef, presubmits.statusContextOwners)
+			conditionalJobs = withoutReportedJobs(conditionalJobs, proven, pj.Spec.Refs.BaseRef, presubmits.statusContextOwners)
+		}
+	}
+
 	protectedCommands := testCommands(protectedJobs)
 	testContexts := testCommands(conditionalJobs)
 	if protectedCommands != "" {
@@ -129,7 +149,9 @@ func planDispatchComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 		if !explicit {
 			return "", nil, nil
 		}
-		if mode == modeDelta && secondStageTriggeredAtSHA(context.Background(), pjLister, pj, presubmits) {
+		// A recovered terminal proof already says the second stage ran at this
+		// HEAD; prefer it over repeating the cache lookup below.
+		if mode == modeDelta && (proven.Len() > 0 || secondStageTriggeredAtSHA(context.Background(), pjLister, pj, presubmits)) {
 			comment = fmt.Sprintf("**Pipeline controller notification**\n\nAll applicable second-stage tests for this HEAD have already been triggered. Nothing new to schedule.\n\nUse `/test ?` to see all available tests, or `/pipeline required` to re-run the full required set for the `%s` branch.", pj.Spec.Refs.BaseRef)
 		} else {
 			comment = fmt.Sprintf("**Pipeline controller notification**\n\nNo second-stage tests were triggered for this PR.\n\nThis can happen when:\n- The changed files don't match any `pipeline_run_if_changed` patterns\n- All files match `pipeline_skip_if_only_changed` patterns\n- No pipeline-controlled jobs are defined for the `%s` branch\n\nUse `/test ?` to see all available tests.", pj.Spec.Refs.BaseRef)
@@ -205,6 +227,97 @@ func secondStageTriggeredAtSHA(ctx context.Context, pjLister ctrlruntimeclient.R
 		}
 	}
 	return false
+}
+
+// canReuseStatus accepts only contexts uniquely owned in the complete static
+// inventory by a presubmit restricted to the literal target base.
+func canReuseStatus(presubmit config.Presubmit, base string, owners map[string]string) bool {
+	contextKey := strings.ToLower(presubmit.Context)
+	if base == "" || presubmit.SkipReport || contextKey == "" || contextKey == pipelineGate {
+		return false // unreportable contexts cannot be verified on GitHub
+	}
+	if owner := owners[contextKey]; owner == "" || owner != presubmit.Name {
+		return false // unknown or shared context ownership
+	}
+	return len(presubmit.Branches) == 1 &&
+		presubmit.Branches[0] == "^"+regexp.QuoteMeta(base)+"$" &&
+		len(presubmit.SkipBranches) == 0
+}
+
+// terminalReportedContexts recovers attempted second-stage contexts from terminal statuses.
+// Only unambiguous single-base contexts qualify, and the PR must still match refs.
+// Pending may be our own placeholder and is never evidence of an attempt.
+func terminalReportedContexts(ghc minimalGhClient, refs *v1.Refs, owners map[string]string, candidates []config.Presubmit) (sets.Set[string], error) {
+	if ghc == nil || refs == nil || len(refs.Pulls) == 0 || refs.Pulls[0].SHA == "" {
+		return nil, nil
+	}
+	sha := refs.Pulls[0].SHA
+	prName := fmt.Sprintf("%s/%s#%d", refs.Org, refs.Repo, refs.Pulls[0].Number)
+
+	var reportable []config.Presubmit
+	for _, presubmit := range candidates {
+		if !canReuseStatus(presubmit, refs.BaseRef, owners) {
+			continue // the context cannot be attributed to this base branch
+		}
+		reportable = append(reportable, presubmit)
+	}
+	if len(reportable) == 0 {
+		return nil, nil
+	}
+
+	combined, err := ghc.GetCombinedStatus(refs.Org, refs.Repo, sha)
+	if err != nil {
+		return nil, fmt.Errorf("getting combined status for pruned second-stage jobs of %s: %w", prName, err)
+	}
+	if combined == nil {
+		return nil, fmt.Errorf("empty combined status response for pruned second-stage jobs of %s", prName)
+	}
+	if combined.SHA != sha {
+		return nil, fmt.Errorf("combined status response for pruned second-stage jobs of %s has sha %q, want %q", prName, combined.SHA, sha)
+	}
+
+	// GitHub reports the latest status of every context on the ref; the
+	// aggregate combined state is deliberately ignored.
+	states := make(map[string]string, len(combined.Statuses))
+	for _, status := range combined.Statuses {
+		states[status.Context] = status.State
+	}
+	terminal := sets.New[string]()
+	for _, presubmit := range reportable {
+		switch states[presubmit.Context] {
+		case github.StatusSuccess, github.StatusFailure, github.StatusError:
+			terminal.Insert(presubmit.Context)
+		}
+	}
+	if terminal.Len() == 0 {
+		return terminal, nil
+	}
+
+	pr, err := ghc.GetPullRequest(refs.Org, refs.Repo, refs.Pulls[0].Number)
+	if err != nil {
+		return nil, fmt.Errorf("getting pull request for pruned second-stage jobs of %s: %w", prName, err)
+	}
+	if pr == nil {
+		return nil, fmt.Errorf("empty pull request response for pruned second-stage jobs of %s", prName)
+	}
+	if pr.State != github.PullRequestStateOpen || pr.Draft ||
+		pr.Head.SHA != sha || pr.Base.Ref != refs.BaseRef {
+		return nil, fmt.Errorf("stale terminal statuses for pruned second-stage jobs of %s: pull request state %q draft %t head %q base %q", prName, pr.State, pr.Draft, pr.Head.SHA, pr.Base.Ref)
+	}
+	return terminal, nil
+}
+
+// withoutReportedJobs removes only eligible definitions with a reported context;
+// another definition sharing a job name must remain schedulable.
+func withoutReportedJobs(jobs []config.Presubmit, reported sets.Set[string], base string, owners map[string]string) []config.Presubmit {
+	var kept []config.Presubmit
+	for _, job := range jobs {
+		if canReuseStatus(job, base, owners) && reported.Has(job.Context) {
+			continue
+		}
+		kept = append(kept, job)
+	}
+	return kept
 }
 
 // pipelineAnnotationMatches gives run-if-changed precedence over skip-if-only-changed.
@@ -340,8 +453,12 @@ func isFirstStageJob(presubmits presubmitTests, name string) bool {
 	return false
 }
 
-// Both paths trust the latest matching ProwJob, including successful overrides.
-func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {
+// checkFirstStageComplete trusts live ProwJobs first and recovers missing
+// always-required results from GitHub statuses for the PR's current revision.
+// Recovered statuses count only for jobs that pass the canReuseStatus
+// eligibility guard, so a context shared across base branches (or a repo with
+// an unknown reporting inventory) stays incomplete instead of guessing.
+func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Reader, ghc minimalGhClient, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {
 	if pj == nil || pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) != 1 {
 		return false, nil
 	}
@@ -376,17 +493,22 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 
 	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
 
-	// All always-required first-stage jobs must have succeeded
+	// All always-required first-stage jobs must have succeeded; ones missing
+	// from the cache may have been pruned after succeeding and are decided by
+	// the GitHub status fallback below.
+	var missing []config.Presubmit
 	for _, presubmit := range presubmits.alwaysRequired {
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
-		if job := latestBatch[presubmit.Name]; job == nil || job.Status.State != v1.SuccessState {
+		if job := latestBatch[presubmit.Name]; job == nil {
+			missing = append(missing, presubmit)
+		} else if job.Status.State != v1.SuccessState {
 			return false, nil
 		}
 	}
 
-	// Conditionally-required first-stage jobs, if present, must have succeeded
+	// Conditionally-required first-stage jobs, if present, must have succeeded.
 	for _, presubmit := range presubmits.conditionallyRequired {
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
@@ -396,5 +518,62 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 		}
 	}
 
+	if len(missing) == 0 {
+		return true, nil
+	}
+
+	// A late LGTM or override can arrive after sinker deleted the successful
+	// runs. Only the missing jobs' exact contexts count; the aggregate combined
+	// state (pipeline gate, second-stage contexts) must not block. A context
+	// that fails the canReuseStatus eligibility guard also stays incomplete:
+	// its status cannot be attributed to this PR's base branch, so the first
+	// stage must be proven again rather than guessed from an ambiguous green.
+	if ghc == nil {
+		return false, fmt.Errorf("no github client to verify pruned first-stage jobs of %s", pj.Name)
+	}
+	if pj.Spec.Refs.Pulls[0].SHA == "" {
+		return false, nil
+	}
+	for _, presubmit := range missing {
+		if !canReuseStatus(presubmit, pj.Spec.Refs.BaseRef, presubmits.statusContextOwners) {
+			return false, nil
+		}
+	}
+	// A stale ProwJob event says nothing about the current PR, so its statuses
+	// count only while it is open, not a draft, and on the same HEAD and base.
+	pr, err := ghc.GetPullRequest(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number)
+	if err != nil {
+		return false, fmt.Errorf("getting pull request for pruned first-stage jobs of %s: %w", pj.Name, err)
+	}
+	if pr == nil {
+		return false, fmt.Errorf("empty pull request response for pruned first-stage jobs of %s", pj.Name)
+	}
+	if pr.State != github.PullRequestStateOpen || pr.Draft ||
+		pr.Head.SHA != pj.Spec.Refs.Pulls[0].SHA || pr.Base.Ref != pj.Spec.Refs.BaseRef {
+		return false, nil
+	}
+	combined, err := ghc.GetCombinedStatus(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].SHA)
+	if err != nil {
+		return false, fmt.Errorf("getting combined status for pruned first-stage jobs of %s: %w", pj.Name, err)
+	}
+	if combined == nil {
+		return false, fmt.Errorf("empty combined status response for pruned first-stage jobs of %s", pj.Name)
+	}
+	if combined.SHA != pj.Spec.Refs.Pulls[0].SHA {
+		return false, nil
+	}
+	states := make(map[string]string, len(combined.Statuses))
+	for _, status := range combined.Statuses {
+		states[status.Context] = status.State
+	}
+	for _, presubmit := range missing {
+		if states[presubmit.Context] != github.StatusSuccess {
+			return false, nil
+		}
+	}
+	// The GitHub methods above do not accept ctx.
+	if err := ctx.Err(); err != nil {
+		return false, fmt.Errorf("checking first-stage completion after GitHub lookups: %w", err)
+	}
 	return true, nil
 }

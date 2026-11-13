@@ -132,6 +132,18 @@ The pipeline controller automatically detects which tests should run based on:
 
 The controller analyzes the files changed in your PR and determines which tests are relevant.
 
+### First-Stage Completion and Pruned Jobs
+
+Prow's sinker deletes completed ProwJobs once they age past its retention window, counted from job start rather than completion. When a late LGTM or override arrives after that, the finished first-stage runs are no longer in the controller's cache, and waiting for a live object would stall the pipeline.
+
+Live ProwJobs always decide first: a required or conditional first-stage job that is still present and has not succeeded blocks the second stage, with no GitHub traffic. Only always-required jobs that are entirely absent from the cache are decided differently: the controller reads the commit statuses those jobs reported on GitHub for the exact PR HEAD, after confirming the PR is still open, not a draft, and on that same HEAD and target branch. The aggregate combined status is ignored; every missing job's exact context must report success. Jobs that skip reporting, or use the `ci/pipeline-gate` context, cannot be verified this way and keep blocking. Agentic readiness and traditional dispatch use this same check.
+
+Before any status is read, a shared eligibility guard decides whether the context can be attributed to the PR's base branch at all. GitHub statuses are commit- and context-scoped: a green context proves only that the context succeeded on that commit, not which job, definition or base branch produced it. The guard accepts a context only when the controller's complete static reporting inventory shows exactly one reportable job definition owning it (optional and manually triggered definitions count, contexts are compared case-insensitively as GitHub does, and a postsubmit reporting the same context counts as a second owner because Prow reports postsubmits on base branches), and when the candidate job runs on exactly one branch, written as the canonical pattern `^<base-ref>$`, with no `skip_branches`. Repositories with in-repo config enabled keep an unknown inventory, since in-repo definitions are invisible to it, and decline the fallback entirely.
+
+The guard is deliberately strict, so the fallback covers less than native status reporting: contexts reported by more than one definition (repeating the same job name on disjoint branches is a second definition, not a deduplication), jobs that run on every branch or on several branches, and prefix or broad patterns such as `^master` next to `^master$` are never recovered from statuses, nor are the widely shared generated contexts like `ci/prow/build`. Such contexts stay cluster-only: a missing first-stage job keeps the pipeline incomplete and a second-stage candidate is scheduled and gets its pending placeholder, never an API error. This is an accepted limitation, not a complete recovery of the original API behavior: the provenance of statuses written by historical configurations or external writers cannot be proven, so ambiguous ownership is declined rather than guessed.
+
+The fallback costs one pull request lookup plus one batched combined-status lookup, and only when at least one missing job passes the guard; the status lookup may fetch additional pages. The current PR, HEAD and base validation is therefore required before statuses are accepted.
+
 ## Always Required Second-Stage Tests
 
 Always required second-stage tests are tests that:
@@ -231,11 +243,15 @@ Add the annotation to your test configuration in the ci-operator config file:
 
 If you manually trigger some second-stage tests (using `/test <job-name>`) in Automatic or LGTM mode before the automatic trigger occurs, the controller **complements** your work instead of latching into manual control. When it next schedules the second stage, it:
 
-1. Detects, from its in-cluster ProwJob cache, which second-stage jobs already have a run at the current HEAD (no extra GitHub calls are made for this check)
+1. Detects which second-stage jobs already have a run at the current HEAD: from its in-cluster ProwJob cache first, and then, for the remaining candidates whose context passes the status-attribution guard (see "First-Stage Completion and Pruned Jobs"), with one batched GitHub combined-status read on that exact HEAD
 2. Schedules only the remaining required jobs — the "delta" — skipping the ones already triggered
 3. Re-evaluates from scratch whenever the PR HEAD changes
 
 This complements manual triggers without re-running jobs that already started. If nothing remains to schedule because every applicable job already ran for the current HEAD, the controller says so rather than claiming no tests were triggered. To re-run a specific job that already ran, use `/test <job>`; to run the delta on demand, use `/pipeline remaining`.
+
+The status read also covers second-stage jobs pruned by sinker (see "First-Stage Completion and Pruned Jobs"): a terminal status (success, failure or error) for a job's context on the exact current HEAD proves the job already ran there and counts as triggered. Only contexts that pass the shared eligibility guard are read: a context with shared or unknown ownership, or a definition that does not run on exactly the PR's base branch, is not proof, so its job is scheduled like any missing one instead of failing the dispatch. Pending never counts, because the controller itself publishes pending placeholders before dispatching. The proof says an attempt happened, not that it passed: a failed or errored context is skipped just like a successful one, and re-running it needs `/test <job>` or `/pipeline required`, the same as for a job whose ProwJob is still in the cache. `/pipeline required` ignores this proof and re-fires the whole required set. When a proof is found, the live PR is validated once (open, not a draft, same HEAD and base branch) before the statuses are trusted, and failed or stale lookups block scheduling instead of re-running completed tests. There is no polling: a delta costs at most one batched status read plus the optional PR validation, and jobs already covered by the cache need no GitHub call.
+
+Opening, pushing or reopening a PR publishes pending placeholders for the selected second-stage jobs the same way, but a context whose terminal result was verified on that HEAD keeps it. A context that cannot be attributed to the base branch is never verified and always receives its pending placeholder. If the verification lookup fails, pending placeholders are published for every selected job instead, so an API outage cannot leave required contexts absent while a green pipeline gate would let the PR merge.
 
 ## Agentic Handoff (Chai)
 
@@ -253,7 +269,9 @@ Requires GitHub App authentication, `--agentic-trusted-author=<chai-login>`
 (repeatable) and optional `--agentic-timeout=20m`. There is no storage requirement.
 
 1. In automatic mode, applicable first-stage tests pass in the shared ProwJob cache
-   (including overrides). LGTM mode also requires the current `lgtm` or `pipeline-auto`
+   (including overrides; jobs pruned by sinker are verified from their commit
+   statuses on the current HEAD, see "First-Stage Completion and Pruned Jobs").
+   LGTM mode also requires the current `lgtm` or `pipeline-auto`
    label set by `/pipeline auto`; either prerequisite may arrive first.
    Manual mode waits for a trusted user's `/pipeline required` or `/pipeline remaining`.
    In any mode, these commands request handoff immediately without waiting for

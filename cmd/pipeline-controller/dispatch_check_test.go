@@ -79,6 +79,175 @@ func TestTraditionalOpeningGateRespectsLGTMTrigger(t *testing.T) {
 	}
 }
 
+// TestPipelineContextCreationPreservesTerminalResults keeps open/push/reopen
+// events from overwriting terminal job contexts with fresh pending
+// placeholders once their ProwJobs were pruned, publishes pending placeholders
+// for every selected job when the verification fails (merge safety: an
+// unknown history must keep blocking merges), and keeps agentic-enrolled
+// branches on their no-legacy-side-effects path.
+func TestPipelineContextCreationPreservesTerminalResults(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		action        github.PullRequestEventAction
+		headSHA       string
+		agentic       bool
+		greenGate     bool
+		tokenAuth     bool
+		sharedContext bool
+		sharedJobName bool
+		combined      *github.CombinedStatus
+		wantPending   []string
+		wantScheduled []string
+		wantReads     int
+		wantPRCalls   int
+	}{
+		{
+			name:        "reopen preserves terminal results, unproven jobs stay pending",
+			action:      github.PullRequestActionReopened,
+			combined:    &github.CombinedStatus{SHA: strings.Repeat("a", 40), Statuses: []github.Status{{Context: "ci/e2e", State: github.StatusSuccess}}},
+			wantPending: []string{"ci/conditional"},
+			wantReads:   1,
+			wantPRCalls: 1,
+		},
+		{
+			name:          "shared context ownership cannot prove terminal results",
+			action:        github.PullRequestActionReopened,
+			sharedContext: true,
+			combined:      &github.CombinedStatus{SHA: strings.Repeat("a", 40), Statuses: []github.Status{{Context: "ci/e2e", State: github.StatusSuccess}}},
+			wantPending:   []string{"ci/conditional", "ci/e2e"},
+		},
+		{
+			name:          "same job name cannot transfer proof to a broad definition",
+			action:        github.PullRequestActionReopened,
+			sharedJobName: true,
+			combined: &github.CombinedStatus{SHA: strings.Repeat("a", 40), Statuses: []github.Status{
+				{Context: "ci/e2e", State: github.StatusSuccess},
+				{Context: "ci/multi-base", State: github.StatusSuccess},
+			}},
+			wantPending:   []string{"ci/conditional", "ci/multi-base"},
+			wantScheduled: []string{"ci/multi-base", "ci/conditional"},
+			wantReads:     1,
+			wantPRCalls:   1,
+		},
+		{
+			name:        "new head gets fresh pending contexts",
+			action:      github.PullRequestActionSynchronize,
+			headSHA:     strings.Repeat("b", 40),
+			combined:    &github.CombinedStatus{SHA: strings.Repeat("b", 40)},
+			wantPending: []string{"ci/conditional", "ci/e2e"},
+			wantReads:   1,
+		},
+		{
+			name:        "stale proof falls back to pending placeholders",
+			action:      github.PullRequestActionReopened,
+			headSHA:     strings.Repeat("b", 40),
+			combined:    &github.CombinedStatus{SHA: strings.Repeat("b", 40), Statuses: []github.Status{{Context: "ci/e2e", State: github.StatusSuccess}}},
+			wantPending: []string{"ci/conditional", "ci/e2e"},
+			wantReads:   1,
+			wantPRCalls: 1,
+		},
+		{
+			name:        "green gate survives a failed lookup",
+			action:      github.PullRequestActionOpened,
+			greenGate:   true,
+			combined:    &github.CombinedStatus{SHA: "deadbeefdeadbeef", Statuses: []github.Status{{Context: "ci/e2e", State: github.StatusSuccess}}},
+			wantPending: []string{"ci/conditional", "ci/e2e"},
+			wantReads:   1,
+		},
+		{
+			name:        "token auth publishes pending on a failed lookup",
+			action:      github.PullRequestActionOpened,
+			tokenAuth:   true,
+			combined:    &github.CombinedStatus{SHA: "deadbeefdeadbeef", Statuses: []github.Status{{Context: "ci/e2e", State: github.StatusSuccess}}},
+			wantPending: []string{"ci/conditional", "ci/e2e"},
+			wantReads:   1,
+		},
+		{
+			name:      "agentic branch bypasses legacy context creation",
+			action:    github.PullRequestActionOpened,
+			agentic:   true,
+			wantReads: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgenticFixture(t, "auto")
+			if tc.sharedJobName {
+				static := f.cfg.GetPresubmitsStatic("org/repo")
+				static = append(static, config.Presubmit{
+					JobBase:      config.JobBase{Name: "pull-ci-org-repo-main-e2e"},
+					Brancher:     config.Brancher{Branches: []string{"^(main|release)$"}},
+					Reporter:     config.Reporter{Context: "ci/multi-base"},
+					RerunCommand: "/test multi-base",
+				})
+				require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}))
+				f.a.configDataProvider.gatherData()
+			}
+			if tc.sharedContext {
+				// An optional reporter on another base branch claims the same
+				// context (GitHub compares contexts case-insensitively), so
+				// the terminal status cannot be attributed to this base and
+				// must not suppress the pending placeholder.
+				static := f.cfg.GetPresubmitsStatic("org/repo")
+				static = append(static, config.Presubmit{
+					JobBase:  config.JobBase{Name: "pull-ci-org-repo-release-e2e"},
+					Optional: true,
+					Brancher: config.Brancher{Branches: []string{"^release$"}},
+					Reporter: config.Reporter{Context: "CI/E2E"},
+				})
+				require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}))
+				f.a.configDataProvider.gatherData()
+			}
+			f.gh.changes = []github.PullRequestChange{{Filename: "cmd/main.go"}}
+			f.gh.combinedStatus = tc.combined
+			presubmits := f.a.configDataProvider.updatedPresubmits["org/repo"]
+			presubmits.pipelineConditionallyRequired = append(presubmits.pipelineConditionallyRequired, config.Presubmit{
+				JobBase:  config.JobBase{Name: "pull-ci-org-repo-main-conditional", Annotations: map[string]string{"pipeline_run_if_changed": "^cmd/"}},
+				Reporter: config.Reporter{Context: "ci/conditional"}})
+			f.a.configDataProvider.updatedPresubmits["org/repo"] = presubmits
+			cw := &clientWrapper{ghc: f.gh, configDataProvider: f.a.configDataProvider,
+				watcher: f.a.watcher, lgtmWatcher: f.a.lgtmWatcher, checks: f.a.checks}
+			if tc.agentic {
+				cw.agentic = f.a
+			}
+			if tc.tokenAuth {
+				cw.checks = nil
+			}
+			if tc.greenGate {
+				_, err := f.gh.CreateCheckRun("org", "repo", traditionalCheck(pullRefs("org", "repo", &f.gh.pr), "completed", "success", "previous dispatch"))
+				require.NoError(t, err)
+			}
+			event := f.gh.pr
+			if tc.headSHA != "" {
+				event.Head.SHA = tc.headSHA
+			}
+			cw.handlePipelineContextCreation(f.a.logger, github.PullRequestEvent{
+				Action: tc.action, Repo: f.gh.pr.Base.Repo, PullRequest: event})
+
+			var pending []string
+			for _, status := range f.gh.statusUpdates {
+				require.Equal(t, "pending", status.State)
+				pending = append(pending, status.Context)
+			}
+			require.Equal(t, tc.wantPending, pending)
+			require.Equal(t, tc.wantReads, f.gh.statusReads)
+			require.Equal(t, tc.wantPRCalls, f.gh.getPullRequestCalls)
+			if tc.greenGate {
+				require.Equal(t, "success", f.gh.checks[0].Conclusion, "a green gate must survive the failed lookup")
+			}
+			if tc.wantScheduled != nil {
+				_, jobs, err := planDispatchComment(presubmits, &v1.ProwJob{Spec: v1.ProwJobSpec{
+					Refs: pullRefs("org", "repo", &f.gh.pr)}}, f.gh, newFakePJLister(), modeDelta, false)
+				require.NoError(t, err)
+				var contexts []string
+				for _, job := range jobs {
+					contexts = append(contexts, job.Context)
+				}
+				require.Equal(t, tc.wantScheduled, contexts)
+			}
+		})
+	}
+}
+
 func TestTraditionalDispatchCheckModes(t *testing.T) {
 	for _, mode := range []string{"auto", "lgtm", "manual"} {
 		t.Run(mode, func(t *testing.T) {
@@ -202,7 +371,7 @@ func TestTraditionalDispatchFailuresAndRetry(t *testing.T) {
 				// the same check without another /test comment or waiting for results.
 				gh.failCheck, gh.afterCheckWrite = false, nil
 				reader = newFakePJLister(makeProwJob(job.Name, pj.Spec.Refs.Pulls[0].SHA))
-				ready, err := checkFirstStageComplete(context.Background(), reader, pj, presubmits)
+				ready, err := checkFirstStageComplete(context.Background(), reader, gh, pj, presubmits)
 				require.NoError(t, err)
 				require.True(t, ready)
 				require.NoError(t, sendCommentWithMode(presubmits, pj, gh, func() {}, reader, modeDelta, false, checks))
