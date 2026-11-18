@@ -26,9 +26,17 @@ type realClock struct{}
 func (realClock) Now() time.Time { return time.Now().UTC() }
 
 // threadCache retains complete threads when history metadata is unchanged.
+// FetchedAt records the last confirmed complete-thread read, which only a
+// full sync or a targeted reload can establish; a single posted message
+// never advances it. RefreshAfter bounds the next targeted read and
+// RefreshFailed marks a cooldown that originates from a failed read rather
+// than a fresh success.
 type threadCache struct {
-	Root    slack.Message
-	Replies []slack.Message
+	Root          slack.Message
+	Replies       []slack.Message
+	FetchedAt     time.Time
+	RefreshAfter  time.Time
+	RefreshFailed bool
 }
 
 // pendingDelivery prevents blind retries after an ambiguous transport failure.
@@ -239,6 +247,12 @@ func (s *Service) Sync(ctx context.Context) error {
 			if err != nil {
 				return s.degrade(previous, fmt.Errorf("reading thread %s: %w", root.Timestamp, err))
 			}
+			// Only an actual reply read advances the per-root fetch time and
+			// resets memoized targeted-read failures; unchanged roots keep
+			// their fetch time and any valid rate cooldown untouched.
+			thread.FetchedAt = s.clock.Now()
+			thread.RefreshFailed = false
+			thread.RefreshAfter = time.Time{}
 		}
 		thread.Root = root
 		threads[root.Timestamp] = thread

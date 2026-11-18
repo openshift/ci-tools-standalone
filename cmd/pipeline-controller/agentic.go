@@ -231,7 +231,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 				return nil
 			}
 			pj := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: pullRefs(work.org, work.repo, pr)}}
-			complete, err := checkFirstStageComplete(ctx, a.reader, pj, a.configDataProvider.GetPresubmits(work.org+"/"+work.repo))
+			complete, err := checkFirstStageComplete(ctx, a.reader, a.gh, pj, a.configDataProvider.GetPresubmits(work.org+"/"+work.repo))
 			if err != nil || !complete {
 				return err
 			}
@@ -366,7 +366,7 @@ func (a *agenticController) dispatchTraditional(ctx context.Context, work agenti
 	}
 	pj := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: pullRefs(work.org, work.repo, pr)}}
 	presubmits := a.configDataProvider.GetPresubmits(work.org + "/" + work.repo)
-	complete, err := checkFirstStageComplete(ctx, a.reader, pj, presubmits)
+	complete, err := checkFirstStageComplete(ctx, a.reader, a.gh, pj, presubmits)
 	if err != nil || !complete {
 		return err
 	}

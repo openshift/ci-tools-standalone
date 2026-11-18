@@ -80,7 +80,9 @@ func (a *demoArchive) Post(ctx context.Context, channel, root, requestID string,
 		a.threads[root] = append(a.threads[root], slack.Message{Msg: slack.Msg{Type: "message", SubType: "bot_message", User: a.writer.UserID, BotID: a.writer.BotID, ThreadTimestamp: root, Timestamp: timestamp, ClientMsgID: requestID, Text: message.Text, Metadata: message.Metadata}})
 		a.roots[i].ReplyCount++
 		a.roots[i].LatestReply = timestamp
-		a.chaiReply(i, message.Text)
+		if message.Metadata.EventType != opsalerts.ThreadReplyMetadataEvent || strings.Contains(message.Text, "<@U_CHAI>") {
+			a.chaiReply(i, message.Text)
+		}
 		return timestamp, nil
 	}
 	return "", fmt.Errorf("%w: demo alert root does not exist", opsalerts.ErrDeliveryFailed)
@@ -227,6 +229,9 @@ Read-only demo scan; no resources were changed.`},
 	}
 	roots = append(roots, demoMessage(now, 10*time.Hour, "U_CHAI", "B_CHAI", "[Scheduled task: pending_workloads_scan | Instructions: earlier/instructions.md]\nPending workload scan: one queue needs follow-up\n\n• build01: 2 Pending at the scan snapshot. Check eligible worker capacity.\n\nCoverage: inspected 16 of 17 contexts.\nCoverage gap: build13 could not be inspected.\nSynthetic demo report; this is earlier task history, not live cluster state."))
 	archive := &demoArchive{roots: roots, threads: map[string][]slack.Message{}, next: now.Add(-time.Second), writer: cfg.Writer}
+	if err := seedDemoDiscussion(archive, now); err != nil {
+		return nil, err
+	}
 	classes, err := opsalerts.LoadClassification(demoClassification)
 	if err != nil {
 		return nil, err

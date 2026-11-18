@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
@@ -18,13 +20,19 @@ import (
 
 // fakeGhClient implements minimalGhClient for testing.
 type fakeGhClient struct {
-	comments    []string
-	changes     []github.PullRequestChange
-	pullRequest *github.PullRequest
-	addedLabels []string
+	comments               []string
+	changes                []github.PullRequestChange
+	pullRequest            *github.PullRequest
+	addedLabels            []string
+	combinedStatus         *github.CombinedStatus
+	getCombinedStatusErr   error
+	getPullRequestCalls    int
+	getCombinedStatusCalls int
+	cancelStatusLookup     context.CancelFunc
 }
 
 func (f *fakeGhClient) GetPullRequest(org, repo string, number int) (*github.PullRequest, error) {
+	f.getPullRequestCalls++
 	if f.pullRequest != nil {
 		return f.pullRequest, nil
 	}
@@ -51,6 +59,23 @@ func (f *fakeGhClient) AddLabel(org, repo string, number int, label string) erro
 
 func (f *fakeGhClient) GetIssueLabels(org, repo string, number int) ([]github.Label, error) {
 	return nil, nil
+}
+
+// GetCombinedStatus records fallback lookups and returns the configured result.
+func (f *fakeGhClient) GetCombinedStatus(org, repo, ref string) (*github.CombinedStatus, error) {
+	f.getCombinedStatusCalls++
+	if f.cancelStatusLookup != nil {
+		f.cancelStatusLookup()
+	}
+	if f.getCombinedStatusErr != nil {
+		return nil, f.getCombinedStatusErr
+	}
+	if f.combinedStatus != nil {
+		return f.combinedStatus, nil
+	}
+	// Default to the requested ref with no statuses, so a first dispatch with
+	// nothing to prove keeps its normal behavior.
+	return &github.CombinedStatus{SHA: ref}, nil
 }
 
 func newFakePJLister(pjs ...v1.ProwJob) ctrlruntimeclient.Reader {
@@ -604,6 +629,169 @@ func TestSendCommentWithMode_ImplicitEmptyIsSilent(t *testing.T) {
 	}
 }
 
+// TestPlanDispatchCommentTerminalReportedJobs covers the commit-status proof
+// for second-stage jobs pruned from the ProwJob cache: terminal statuses
+// (success, failure and error all count as an attempt) suppress scheduling,
+// pending never counts, modeForce ignores the proof, cache coverage needs no
+// lookup, and lookup failures fail closed instead of mass-scheduling.
+func TestPlanDispatchCommentTerminalReportedJobs(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+	)
+
+	protectedJob := fmt.Sprintf("pull-ci-%s-%s-%s-protected", org, repo, baseRef)
+	conditionalJob := fmt.Sprintf("pull-ci-%s-%s-%s-conditional", org, repo, baseRef)
+	// The canonical single-base brancher and the unique context ownership
+	// below keep both jobs eligible for the status fallback this test covers.
+	canonical := config.Brancher{Branches: []string{"^" + baseRef + "$"}}
+	presubmits := presubmitTests{
+		protected: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: protectedJob},
+			Brancher:     canonical,
+			Reporter:     config.Reporter{Context: "ci/protected"},
+			RerunCommand: "/test " + protectedJob,
+		}},
+		pipelineConditionallyRequired: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: conditionalJob, Annotations: map[string]string{"pipeline_run_if_changed": "^cmd/"}},
+			Brancher:     canonical,
+			Reporter:     config.Reporter{Context: "ci/conditional"},
+			RerunCommand: "/test " + conditionalJob,
+		}},
+		statusContextOwners: map[string]string{"ci/protected": protectedJob, "ci/conditional": conditionalJob},
+	}
+	changes := []github.PullRequestChange{{Filename: "cmd/main.go"}}
+	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+		Head: github.PullRequestBranch{SHA: sha}, Base: github.PullRequestBranch{Ref: baseRef}}
+	movedPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+		Head: github.PullRequestBranch{SHA: "deadbeefdeadbeef"}, Base: github.PullRequestBranch{Ref: baseRef}}
+
+	tests := []struct {
+		name        string
+		force       bool
+		existingPJs []v1.ProwJob
+		pr          *github.PullRequest
+		statuses    []github.Status
+		wrongSHA    bool
+		statusErr   error
+		wantErr     string
+		wantJobs    []string
+		wantComment string
+		wantReads   int
+		wantPRCalls int
+	}{
+		{
+			name: "terminal success and failure suppress scheduling",
+			statuses: []github.Status{{Context: "ci/protected", State: github.StatusSuccess},
+				{Context: "ci/conditional", State: github.StatusFailure}},
+			wantComment: "already been triggered",
+			wantReads:   1,
+			wantPRCalls: 1,
+		},
+		{
+			name: "error and pending statuses filter partially",
+			statuses: []github.Status{{Context: "ci/protected", State: github.StatusError},
+				{Context: "ci/conditional", State: github.StatusPending}},
+			wantJobs:    []string{conditionalJob},
+			wantReads:   1,
+			wantPRCalls: 1,
+		},
+		{
+			name:      "pending or missing statuses schedule everything",
+			statuses:  []github.Status{{Context: "ci/protected", State: github.StatusPending}},
+			wantJobs:  []string{protectedJob, conditionalJob},
+			wantReads: 1,
+		},
+		{
+			name:  "force re-fires terminal jobs without a status lookup",
+			force: true,
+			statuses: []github.Status{{Context: "ci/protected", State: github.StatusSuccess},
+				{Context: "ci/conditional", State: github.StatusSuccess}},
+			wantJobs: []string{protectedJob, conditionalJob},
+		},
+		{
+			name: "cached prowjobs in any state need no lookup",
+			existingPJs: []v1.ProwJob{
+				makeProwJobInState(protectedJob, sha, v1.FailureState),
+				makeProwJob(conditionalJob, sha),
+			},
+			wantComment: "already been triggered",
+		},
+		{
+			name:      "status read error fails closed",
+			statusErr: errors.New("boom"),
+			wantErr:   "getting combined status for pruned second-stage jobs of openshift/myrepo#42: boom",
+			wantReads: 1,
+		},
+		{
+			name:      "combined status for another sha fails closed",
+			wrongSHA:  true,
+			statuses:  []github.Status{{Context: "ci/protected", State: github.StatusSuccess}},
+			wantErr:   `combined status response for pruned second-stage jobs of openshift/myrepo#42 has sha "deadbeefdeadbeef", want "abc1234567890"`,
+			wantReads: 1,
+		},
+		{
+			name:        "moved head rejects the stale proof",
+			pr:          movedPR,
+			statuses:    []github.Status{{Context: "ci/protected", State: github.StatusSuccess}},
+			wantErr:     `stale terminal statuses for pruned second-stage jobs of openshift/myrepo#42: pull request state "open" draft false head "deadbeefdeadbeef" base "main"`,
+			wantReads:   1,
+			wantPRCalls: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pr := tc.pr
+			if pr == nil {
+				pr = openPR
+			}
+			combined := &github.CombinedStatus{SHA: sha, Statuses: tc.statuses}
+			if tc.wrongSHA {
+				combined.SHA = "deadbeefdeadbeef"
+			}
+			ghc := &fakeGhClient{changes: changes, pullRequest: pr, combinedStatus: combined, getCombinedStatusErr: tc.statusErr}
+
+			mode := modeDelta
+			if tc.force {
+				mode = modeForce
+			}
+			comment, jobs, err := planDispatchComment(presubmits, makeTriggerPJ(sha), ghc, newFakePJLister(tc.existingPJs...), mode, true)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error %q, got nil", tc.wantErr)
+				}
+				if diff := cmp.Diff(tc.wantErr, err.Error()); diff != "" {
+					t.Errorf("unexpected error (-want +got):\n%s", diff)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			var names []string
+			for _, job := range jobs {
+				names = append(names, job.Name)
+			}
+			if diff := cmp.Diff(tc.wantJobs, names); diff != "" {
+				t.Errorf("unexpected jobs (-want +got):\n%s", diff)
+			}
+			if tc.wantComment != "" && !strings.Contains(comment, tc.wantComment) {
+				t.Errorf("expected substring %q in comment, got: %q", tc.wantComment, comment)
+			}
+			if ghc.getCombinedStatusCalls != tc.wantReads {
+				t.Errorf("expected %d combined status calls, got %d", tc.wantReads, ghc.getCombinedStatusCalls)
+			}
+			if ghc.getPullRequestCalls != tc.wantPRCalls {
+				t.Errorf("expected %d pull request calls, got %d", tc.wantPRCalls, ghc.getPullRequestCalls)
+			}
+		})
+	}
+}
+
 func TestExistsAtSHA(t *testing.T) {
 	const (
 		org     = "openshift"
@@ -658,6 +846,372 @@ func TestExistsAtSHA(t *testing.T) {
 			}
 			if got != tc.wantExists {
 				t.Errorf("existsAtSHA() = %v, want %v", got, tc.wantExists)
+			}
+		})
+	}
+}
+
+// makeProwJobInState returns a first-stage ProwJob like makeProwJob with an
+// explicit running or terminal state.
+func makeProwJobInState(name, sha string, state v1.ProwJobState) v1.ProwJob {
+	pj := makeProwJob(name, sha)
+	pj.Status.State = state
+	return pj
+}
+
+// TestCheckFirstStageCompletePrunedJobFallback covers the commit-status
+// fallback for always-required jobs deleted from the ProwJob cache by sinker:
+// live ProwJobs stay authoritative and block without GitHub traffic, while
+// missing jobs are verified against the statuses of the exact current HEAD on
+// a still-current, open PR.
+func TestCheckFirstStageCompletePrunedJobFallback(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+	)
+
+	unitJob := fmt.Sprintf("pull-ci-%s-%s-%s-unit", org, repo, baseRef)
+	buildJob := fmt.Sprintf("pull-ci-%s-%s-%s-build", org, repo, baseRef)
+	imagesJob := fmt.Sprintf("pull-ci-%s-%s-%s-images", org, repo, baseRef)
+
+	// The canonical single-base brancher and the unique context ownership
+	// below keep the pruned jobs eligible for the status fallback; the PR's
+	// base SHA is deliberately ahead of anything the controller could have
+	// recorded, pinning that the proof is the context on the HEAD, not a
+	// comparison against the base branch's latest commit.
+	canonical := config.Brancher{Branches: []string{"^" + baseRef + "$"}}
+	unit := config.Presubmit{JobBase: config.JobBase{Name: unitJob}, Brancher: canonical, Reporter: config.Reporter{Context: "ci/unit"}}
+	build := config.Presubmit{JobBase: config.JobBase{Name: buildJob}, Brancher: canonical, Reporter: config.Reporter{Context: "ci/build"}}
+	images := config.Presubmit{JobBase: config.JobBase{Name: imagesJob}, Brancher: canonical, Reporter: config.Reporter{Context: "ci/images"}}
+	standard := presubmitTests{
+		alwaysRequired:        []config.Presubmit{unit, build},
+		conditionallyRequired: []config.Presubmit{images},
+		statusContextOwners:   map[string]string{"ci/unit": unitJob, "ci/build": buildJob, "ci/images": imagesJob},
+	}
+	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+		Head: github.PullRequestBranch{SHA: sha}, Base: github.PullRequestBranch{Ref: baseRef, SHA: "advanced-base-000000"}}
+	// The aggregate state must be ignored; only the exact job contexts count.
+	passing := &github.CombinedStatus{SHA: sha, State: github.StatusFailure, Statuses: []github.Status{
+		{Context: "ci/unit", State: github.StatusSuccess},
+		{Context: "ci/build", State: github.StatusSuccess},
+	}}
+
+	tests := []struct {
+		name            string
+		live            []v1.ProwJob
+		pr              *github.PullRequest
+		combined        *github.CombinedStatus
+		statusErr       error
+		wantComplete    bool
+		wantErr         string
+		wantPRCalls     int
+		wantStatusCalls int
+		cancelLookup    bool
+	}{
+		{
+			name:         "all live successes need no github lookup",
+			live:         []v1.ProwJob{makeProwJob(unitJob, sha), makeProwJob(buildJob, sha)},
+			wantComplete: true,
+		},
+		{
+			name:            "pruned required jobs verified from commit statuses",
+			pr:              openPR,
+			combined:        passing,
+			wantComplete:    true, // the absent conditional job stays non-blocking
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
+		{
+			name: "fresh live override wins over stale pruned statuses",
+			live: []v1.ProwJob{makeProwJob(unitJob, sha)},
+			pr:   openPR,
+			combined: &github.CombinedStatus{SHA: sha, Statuses: []github.Status{
+				{Context: "ci/unit", State: github.StatusFailure},
+				{Context: "ci/build", State: github.StatusSuccess},
+			}},
+			wantComplete:    true,
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
+		{
+			name: "live pending job blocks without a github lookup",
+			live: []v1.ProwJob{makeProwJobInState(unitJob, sha, v1.PendingState)},
+		},
+		{
+			name: "live failed conditional job blocks without a github lookup",
+			live: []v1.ProwJob{makeProwJobInState(imagesJob, sha, v1.FailureState)},
+		},
+		{
+			name: "missing or failing status context is incomplete",
+			pr:   openPR,
+			combined: &github.CombinedStatus{SHA: sha, Statuses: []github.Status{
+				{Context: "ci/unit", State: github.StatusFailure},
+			}},
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
+		{
+			name:            "combined status for another sha is rejected",
+			pr:              openPR,
+			combined:        &github.CombinedStatus{SHA: "deadbeefdeadbeef", Statuses: passing.Statuses},
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
+		{
+			name: "moved pr head rejects the fallback",
+			pr: &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+				Head: github.PullRequestBranch{SHA: "deadbeefdeadbeef"}, Base: github.PullRequestBranch{Ref: baseRef}},
+			wantPRCalls: 1,
+		},
+		{
+			name:            "status lookup failure is wrapped",
+			pr:              openPR,
+			statusErr:       errors.New("boom"),
+			wantErr:         "getting combined status for pruned first-stage jobs of trigger-pj: boom",
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
+		{
+			name:            "cancellation during status lookup prevents readiness",
+			pr:              openPR,
+			combined:        passing,
+			cancelLookup:    true,
+			wantErr:         "checking first-stage completion after GitHub lookups: context canceled",
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ghc := &fakeGhClient{pullRequest: tc.pr, combinedStatus: tc.combined, getCombinedStatusErr: tc.statusErr}
+			if tc.cancelLookup {
+				ghc.cancelStatusLookup = cancel
+			}
+			complete, err := checkFirstStageComplete(ctx, newFakePJLister(tc.live...), ghc, makeTriggerPJ(sha), standard)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error %q, got nil", tc.wantErr)
+				}
+				if diff := cmp.Diff(tc.wantErr, err.Error()); diff != "" {
+					t.Errorf("unexpected error (-want +got):\n%s", diff)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.cancelLookup && !errors.Is(err, context.Canceled) {
+				t.Errorf("expected wrapped context cancellation, got: %v", err)
+			}
+			if diff := cmp.Diff(tc.wantComplete, complete); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantPRCalls, ghc.getPullRequestCalls); diff != "" {
+				t.Errorf("unexpected pull request calls (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantStatusCalls, ghc.getCombinedStatusCalls); diff != "" {
+				t.Errorf("unexpected combined status calls (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestFirstStageStatusFallbackRequiresAttributableContext covers the shared
+// eligibility guard of the first-stage commit-status fallback: GitHub statuses
+// recover a pruned always-required job only when its context is owned by
+// exactly one reportable definition that runs on exactly the PR's base
+// branch. Shared or unknown ownership and unrestricted, broad, multi-pattern
+// or skip-branch definitions stay incomplete without spending any GitHub
+// lookup, while the sole canonical owner still recovers after the base branch
+// moved on: the proof is the context on the HEAD, not a base SHA comparison.
+func TestFirstStageStatusFallbackRequiresAttributableContext(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+	)
+
+	unitJob := fmt.Sprintf("pull-ci-%s-%s-%s-unit", org, repo, baseRef)
+	// Every row reports success for the exact context on the exact HEAD, so
+	// only the eligibility guard can keep a row incomplete.
+	passing := &github.CombinedStatus{SHA: sha, Statuses: []github.Status{
+		{Context: "ci/unit", State: github.StatusSuccess},
+	}}
+	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+		Head: github.PullRequestBranch{SHA: sha},
+		Base: github.PullRequestBranch{Ref: baseRef, SHA: "advanced-base-000000"}}
+
+	tests := []struct {
+		name         string
+		branches     []string
+		skipBranches []string
+		owners       map[string]string
+		wantComplete bool
+	}{
+		{
+			name:     "context shared with another definition stays incomplete",
+			branches: []string{"^main$"},
+			owners:   map[string]string{"ci/unit": ""}, // a second claimant blanked the entry
+		},
+		{
+			name:     "unknown ownership inventory stays incomplete",
+			branches: []string{"^main$"},
+		},
+		{
+			name:     "job running on every branch stays incomplete",
+			branches: nil,
+			owners:   map[string]string{"ci/unit": unitJob},
+		},
+		{
+			name:     "prefix branch pattern stays incomplete",
+			branches: []string{"^main"},
+			owners:   map[string]string{"ci/unit": unitJob},
+		},
+		{
+			name:     "multiple branch patterns stay incomplete",
+			branches: []string{"^main$", "^release$"},
+			owners:   map[string]string{"ci/unit": unitJob},
+		},
+		{
+			name:         "skipped branches stay incomplete",
+			branches:     []string{"^main$"},
+			skipBranches: []string{"^feature$"},
+			owners:       map[string]string{"ci/unit": unitJob},
+		},
+		{
+			name:         "sole owner on the exact base recovers",
+			branches:     []string{"^main$"},
+			owners:       map[string]string{"ci/unit": unitJob},
+			wantComplete: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			presubmits := presubmitTests{
+				alwaysRequired: []config.Presubmit{{
+					JobBase:  config.JobBase{Name: unitJob},
+					Brancher: config.Brancher{Branches: tc.branches, SkipBranches: tc.skipBranches},
+					Reporter: config.Reporter{Context: "ci/unit"},
+				}},
+				statusContextOwners: tc.owners,
+			}
+			ghc := &fakeGhClient{pullRequest: openPR, combinedStatus: passing}
+
+			complete, err := checkFirstStageComplete(context.Background(), newFakePJLister(), ghc, makeTriggerPJ(sha), presubmits)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(tc.wantComplete, complete); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+			}
+			// An ineligible context must not spend GitHub lookups either: the
+			// stage just stays incomplete until a live ProwJob arrives.
+			wantLookups := 0
+			if tc.wantComplete {
+				wantLookups = 1
+			}
+			if diff := cmp.Diff(wantLookups, ghc.getPullRequestCalls); diff != "" {
+				t.Errorf("unexpected pull request calls (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(wantLookups, ghc.getCombinedStatusCalls); diff != "" {
+				t.Errorf("unexpected combined status calls (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestDeltaStatusFallbackRequiresAttributableContext covers the same guard on
+// the second-stage side: a terminal status of a context with shared or
+// unknown ownership is not proof, so the delta planner still schedules the
+// job and publishes its pending placeholder (an ambiguous history blocks, it
+// never fails the dispatch), while the sole owner of an exact single-base
+// context is suppressed as already run despite the advanced base SHA.
+func TestDeltaStatusFallbackRequiresAttributableContext(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+	)
+
+	protectedJob := fmt.Sprintf("pull-ci-%s-%s-%s-protected", org, repo, baseRef)
+	terminal := &github.CombinedStatus{SHA: sha, Statuses: []github.Status{
+		{Context: "ci/protected", State: github.StatusSuccess},
+	}}
+	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+		Head: github.PullRequestBranch{SHA: sha},
+		Base: github.PullRequestBranch{Ref: baseRef, SHA: "advanced-base-000000"}}
+
+	tests := []struct {
+		name         string
+		owners       map[string]string
+		wantSchedule bool
+		wantReads    int
+		wantPRCalls  int
+	}{
+		{
+			name:         "shared context schedules and republishes pending",
+			owners:       map[string]string{"ci/protected": ""},
+			wantSchedule: true,
+		},
+		{
+			name:         "unknown ownership schedules without a status lookup",
+			wantSchedule: true,
+		},
+		{
+			name:        "sole owner on the exact base is suppressed",
+			owners:      map[string]string{"ci/protected": protectedJob},
+			wantReads:   1,
+			wantPRCalls: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			presubmits := presubmitTests{
+				protected: []config.Presubmit{{
+					JobBase:      config.JobBase{Name: protectedJob},
+					Brancher:     config.Brancher{Branches: []string{"^" + baseRef + "$"}},
+					Reporter:     config.Reporter{Context: "ci/protected"},
+					RerunCommand: "/test " + protectedJob,
+				}},
+				statusContextOwners: tc.owners,
+			}
+			gh := &fakeAgenticGitHub{pr: *openPR, combinedStatus: terminal}
+
+			if err := sendCommentWithMode(presubmits, makeTriggerPJ(sha), gh, func() {}, newFakePJLister(), modeDelta, true, &dispatchChecks{gh: gh, appID: 101}); err != nil {
+				t.Fatalf("sendCommentWithMode returned error: %v", err)
+			}
+
+			if len(gh.comments) != 1 {
+				t.Fatalf("expected 1 comment, got %d", len(gh.comments))
+			}
+			if tc.wantSchedule {
+				if !strings.Contains(gh.comments[0].Body, "/test "+protectedJob) {
+					t.Errorf("expected the job to be scheduled, got: %q", gh.comments[0].Body)
+				}
+				want := []github.Status{{Context: "ci/protected", State: "pending", Description: PipelinePendingMessage}}
+				if diff := cmp.Diff(want, gh.statusUpdates); diff != "" {
+					t.Errorf("unexpected pending placeholders (-want +got):\n%s", diff)
+				}
+			} else {
+				if !strings.Contains(gh.comments[0].Body, "already been triggered") {
+					t.Errorf("expected the terminal proof to suppress scheduling, got: %q", gh.comments[0].Body)
+				}
+				if len(gh.statusUpdates) != 0 {
+					t.Errorf("expected no pending placeholders for a proven job, got: %v", gh.statusUpdates)
+				}
+			}
+			if diff := cmp.Diff(tc.wantReads, gh.statusReads); diff != "" {
+				t.Errorf("unexpected combined status reads (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantPRCalls, gh.getPullRequestCalls); diff != "" {
+				t.Errorf("unexpected pull request calls (-want +got):\n%s", diff)
 			}
 		})
 	}

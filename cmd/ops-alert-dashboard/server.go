@@ -235,7 +235,7 @@ func (d *dashboard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: https://slack-edge.com https://*.slack-edge.com https://slack-imgs.com https://*.slack-imgs.com https://slack.com https://*.slack.com https://secure.gravatar.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 	if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -274,7 +274,9 @@ func (d *dashboard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.conversations(w, r, actor)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/conversations":
 		d.converse(w, r, actor)
-	case r.Method == http.MethodGet && (r.URL.Path == "/" || r.URL.Path == "/app.js" || r.URL.Path == "/reports.js" || r.URL.Path == "/chat.js" || r.URL.Path == "/style.css"):
+	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && r.URL.Path == "/api/alert-thread":
+		d.alertThread(w, r, actor)
+	case r.Method == http.MethodGet && (r.URL.Path == "/" || r.URL.Path == "/app.js" || r.URL.Path == "/reports.js" || r.URL.Path == "/chat.js" || r.URL.Path == "/threads.js" || r.URL.Path == "/style.css"):
 		d.files.ServeHTTP(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, apiError{Error: "endpoint not found", Code: "not_found"})

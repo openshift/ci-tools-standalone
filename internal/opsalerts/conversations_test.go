@@ -553,6 +553,113 @@ func TestConversationInterestBound(t *testing.T) {
 	}
 }
 
+// TestConversationSkipReleasesRefreshBudget verifies that a background poll
+// which defers or drops its selection without reading Slack returns the shared
+// global budget, so a different stale discussion refreshes immediately.
+func TestConversationSkipReleasesRefreshBudget(t *testing.T) {
+	cases := []struct {
+		name      string
+		readError error
+	}{
+		{name: "cooling root after failed targeted refresh", readError: errors.New("unavailable")},
+		{name: "selected conversation no longer retained"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			service, archive, clock := chatFixture(t)
+			root := archive.roots[0].Timestamp
+			id := "C_TEST:" + root
+			other := "C_TEST:" + archive.roots[1].Timestamp
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			conversation, err := service.Converse(ctx, "operator", ConversationRequest{OccurrenceID: id, RequestID: "linked", Text: "Question?"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !service.TouchConversation(conversation.ID) {
+				t.Fatal("touch rejected retained chat")
+			}
+			if tc.readError != nil {
+				// An ordinary failed targeted refresh cools the root for ten
+				// seconds while its own budget claim lasts only five.
+				archive.repliesError = tc.readError
+				clock.now = clock.now.Add(6 * time.Second)
+				if _, err := service.RefreshAlertThread(ctx, id); !errors.Is(err, ErrNotReady) {
+					t.Fatalf("failed targeted refresh %v", err)
+				}
+				archive.repliesError = nil
+				clock.now = clock.now.Add(5 * time.Second)
+			} else {
+				// A cache rebuild can drop a conversation while its activity
+				// interest still points at it.
+				cache := service.currentCache()
+				cache.Conversations = maps.Clone(cache.Conversations)
+				delete(cache.Conversations, conversation.ID)
+				service.publish(cache)
+				clock.now = clock.now.Add(6 * time.Second)
+			}
+			calls := archive.replyCalls
+			if err := service.SyncConversation(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if archive.replyCalls != calls {
+				t.Fatal("skipped conversation poll read Slack")
+			}
+			// The per-thread deferral keeps the skipped root from being
+			// reselected immediately.
+			if err := service.SyncConversation(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if archive.replyCalls != calls {
+				t.Fatal("skipped root was reselected without a poll interval")
+			}
+			if _, err := service.RefreshAlertThread(ctx, other); err != nil {
+				t.Fatalf("different viewer throttled by skipped poll: %v", err)
+			}
+			if archive.replyCalls != calls+1 {
+				t.Fatal("different viewer did not read immediately")
+			}
+			// The genuine read just performed keeps its budget claim.
+			if !service.activity.Next.Equal(clock.now.Add(conversationRefreshBudget)) {
+				t.Fatal("genuine read did not retain its budget claim")
+			}
+			if err := service.SyncConversation(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if archive.replyCalls != calls+1 {
+				t.Fatal("genuine read budget was released")
+			}
+		})
+	}
+}
+
+// TestReleaseRefreshBudget clears only the exact claimed global deadline.
+func TestReleaseRefreshBudget(t *testing.T) {
+	base := time.Date(2026, 10, 28, 5, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name     string
+		next     time.Time
+		claimed  time.Time
+		wantNext time.Time
+	}{
+		{name: "own claim released", next: base.Add(conversationRefreshBudget), claimed: base.Add(conversationRefreshBudget)},
+		{name: "newer rate-limit backoff kept", next: base.Add(30 * time.Second), claimed: base.Add(conversationRefreshBudget), wantNext: base.Add(30 * time.Second)},
+		{name: "earlier elapsed deadline kept", next: base.Add(-time.Second), claimed: base.Add(conversationRefreshBudget), wantNext: base.Add(-time.Second)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			service, _, _ := fixture(t)
+			service.activity.Next = tc.next
+			service.releaseRefreshBudget(tc.claimed)
+			if !service.activity.Next.Equal(tc.wantNext) {
+				t.Fatalf("global deadline %s want %s", service.activity.Next, tc.wantNext)
+			}
+		})
+	}
+}
+
 // TestConversationUncertaintyScope isolates new-root uncertainty to its operator.
 func TestConversationUncertaintyScope(t *testing.T) {
 	cases := []struct {
@@ -879,7 +986,7 @@ func TestConversationConflictExpiry(t *testing.T) {
 				t.Fatal(err)
 			}
 			record.Request.RequestID = "duplicate"
-			message, err := service.conversationMessage(record)
+			message, err := service.conversationMessage(record, "", "")
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -15,10 +15,13 @@ func TestDemoConversationPosts(t *testing.T) {
 	cases := []struct {
 		name, root string
 		chai       bool
+		plain      bool
 	}{
 		{name: "new question with Chai", chai: true},
 		{name: "new question without mention"},
 		{name: "followup with Chai", root: "100.000001", chai: true},
+		{name: "plain reply", root: "100.000001", plain: true},
+		{name: "plain reply explicitly mentions Chai", root: "100.000001", plain: true, chai: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -31,6 +34,9 @@ func TestDemoConversationPosts(t *testing.T) {
 				text = "<@U_CHAI> " + text
 			}
 			message := slack.Msg{Text: text, Metadata: slack.SlackMetadata{EventType: opsalerts.ConversationMetadataEvent, EventPayload: map[string]interface{}{"record": "test-record"}}}
+			if tc.plain {
+				message.Metadata.EventType = opsalerts.ThreadReplyMetadataEvent
+			}
 			timestamp, err := archive.Post(context.Background(), "CHY2E1BL4", tc.root, "stable-chat-request", message)
 			if err != nil {
 				t.Fatal(err)

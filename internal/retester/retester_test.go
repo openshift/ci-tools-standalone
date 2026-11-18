@@ -18,6 +18,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/prow/pkg/flagutil"
 	configflagutil "sigs.k8s.io/prow/pkg/flagutil/config"
 	"sigs.k8s.io/prow/pkg/github"
 	"sigs.k8s.io/prow/pkg/github/fakegithub"
@@ -904,7 +905,10 @@ func TestRunWithCandidates(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.prowconfig = filepath.Join("testdata", "prowconfig", tc.prowconfig)
 			tc.jobconfig = filepath.Join("testdata", "jobconfig", tc.jobconfig)
-			configOpts := configflagutil.ConfigOptions{ConfigPath: tc.prowconfig, JobConfigPath: tc.jobconfig}
+			configOpts := configflagutil.ConfigOptions{
+				ConfigPath:     tc.prowconfig,
+				JobConfigPaths: flagutil.NewStrings(tc.jobconfig),
+			}
 			configAgent, err := configOpts.ConfigAgent()
 			if err != nil {
 				t.Errorf("Error starting config agent.")

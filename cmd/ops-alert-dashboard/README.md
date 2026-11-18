@@ -54,6 +54,11 @@ alerts, and other DPTP-bot parent notifications default to Orange / Other.
 
 The app must be a member of the channel and its token must be authorized for
 channel history and replies, `chat:write`, and `reactions:write`.
+For discussion display names, avatars and custom emoji, also grant the read
+token `users:read` and `emoji:read`. These directory reads are shared and cached,
+not repeated for every message or browser. Missing directory access leaves
+readable Slack IDs and emoji shortcodes with a warning; it does not grant access
+to additional channels. Bot identity is never changed with `chat:write.customize`.
 See Slack's [history](https://docs.slack.dev/reference/methods/conversations.history/)
 and [replies](https://docs.slack.dev/reference/methods/conversations.replies/)
 documentation for scopes and workspace limits. Read requests fetch every page,
@@ -155,6 +160,39 @@ synthetic, while their SOP previews read the real public documentation on reques
 
 ## Browser preferences and presentation
 
+The workspace uses the full desktop width, with view tabs across the top.
+Select a row to open its detail panel, and use **Close details** to return to the
+full list. **Ask Chai** stays fixed in the bottom-right corner while scrolling,
+with its existing conversation controls.
+
+Alert views also offer an optional **Group by name** checkbox. It collapses
+occurrences that share one alert name, the first parsed identifier, or the
+readable title when no identifier was parsed, behind expandable groups that
+start closed, including single occurrences. Groups with personally unread
+members are listed first, newest-first among themselves, followed by fully
+read groups, also newest-first. Members keep the list's newest-first order
+inside their group. Group counts follow the current view, search,
+category and priority filters, and a group with personally unread members also
+shows their count next to the total, for example `2 new`, using the same
+personal unread state as the row markers. Grouping is display-only: expanding
+a group never marks an alert read or opens the inspector, and every row keeps
+its own checkbox, links and actions. The flat list remains the default, and
+toggling back preserves the current selection and filters. The choice is saved
+per browser in a cookie (about one year, `Path=/`, `SameSite=Lax`, `Secure` on
+HTTPS) that holds no user or alert data, separately from the per-user local
+preferences; unknown, malformed or blocked cookie values fall back to the flat
+list. Which groups are open is kept only for the current visit, including
+across automatic refreshes, and is never persisted.
+
+Checkboxes select open alerts in the current view and filters; **Select all matching**
+includes the entire filtered list. **Close selected**, **Snooze selected**, and
+**WIP selected** preview the exact targets before using a resumable action plan.
+All workflow actions preserve the current view, search, category and priority
+filters. After a confirmed action, an open inspector advances to the next
+unaffected alert in the list, or the previous alert at the end. It closes when
+no other alert remains. Failed or unconfirmed actions keep the current alert;
+explicit navigation while a request is running takes precedence.
+
 Times use the browser's local timezone, including daylight saving. Readable Slack
 and Chai report prose also converts explicit UTC ISO timestamps (`Z`, `+00:00`
 or `+0000`) and `YYYY-MM-DD HH:mm[:ss] UTC` values, showing the local UTC offset.
@@ -191,6 +229,120 @@ An expired proxy session pauses background requests and provides Sign in again.
 Old data is marked stale and action delivery remains unconfirmed until reconciled.
 No pending mutation is replayed automatically after sign-in. The external proxy
 controls session lifetime; the core-ci deployment configures twelve hours.
+
+## Slack discussions
+
+Choose **Load Slack conversation** in an alert's inspector to open its original
+Slack thread in a separate, non-modal discussion panel. Loading a conversation
+does not mark the alert read, acknowledge it, or start a Chai investigation.
+Repeated alert names still have separate source threads; the server resolves
+the destination from the retained occurrence, not browser-supplied channel or
+thread identifiers. **Open in Slack** remains available for the original view.
+
+The panel shows the root message and a bounded page of replies in chronological
+order (up to 30 replies per page). **Load older messages** retrieves earlier
+cached replies only when requested. Names, avatars, bot identity, timestamps, edited indicators,
+mentions, reactions, custom emoji, supported Slack formatting, attachments and
+rich blocks are retained. Unsupported interactive blocks or media are identified
+with a link to the original Slack thread rather than silently interpreted as
+dashboard actions. Message HTML is never executed. Remote images are restricted
+to approved public Slack image hosts and the approved avatar host; arbitrary
+external images are not fetched through a server proxy.
+
+Opening or reopening a discussion requests a fresh Slack read. While the panel
+is open in a visible browser tab, it refreshes automatically every 15 seconds.
+**Refresh Slack conversation** requests the same targeted read immediately;
+neither operation waits for the next full channel sync or depends on changed
+reply-count metadata. Closing the panel, hiding the tab, or losing authentication
+stops automatic refreshes. Returning to a visible open panel requests fresh data.
+Drafts, loaded older pages, and pending delivery guards survive refreshes.
+
+Reads still share the complete Slack thread cache used for workflow recovery.
+Recent successful reads are reused across viewers for five seconds, and targeted
+reads share the active Chai conversation worker's read budget and Slack backoff.
+**Load older messages** remains cache-only. The panel shows the thread's actual
+last successful Slack read time. Failed or throttled refreshes retain displayed
+messages with an error instead of presenting them as newly synchronized, and
+automatic retries respect `Retry-After`. This is polling, not a streaming
+connection or a guarantee that every reply appears within 15 seconds: upstream
+rate limits, read failures, and contention can extend that delay. Refreshes never
+post Slack messages, reactions, or workflow commands.
+
+User profiles and relevant custom emoji are resolved lazily through a
+bounded shared directory cache, including cached failures, so reopening a thread
+does not repeat fresh directory lookups. Successful metadata is cached for one
+hour and failures for five minutes; Slack rate-limit backoff is shared across
+viewers. The directory cache retains at most 512 identities and 4,096 custom
+emoji, with bounded page-level enrichment and no remote image proxy.
+
+Only **Post reply** sends a message. Replies go to the selected alert's original
+thread as the configured dashboard bot, with the authenticated operator clearly
+attributed in the visible Slack header as well as the delivery record. They do
+not impersonate a Slack user or change alert workflow state. Chai is notified
+only when explicitly mentioned. The composer accepts up to 4,000 UTF-8 bytes.
+
+Explicit mentions remain actionable. Workspace `@handles` resolve to active,
+unambiguous Slack user IDs, including users who have never appeared in a cached
+discussion. Use the Slack handle, not a display name. `@chai-bot` uses the
+configured Chai Slack user ID, and the configured channel name (for example
+`#ops-testplatform`) resolves to its channel ID.
+Canonical Slack references such as `<@U123ABC>` and `<#C123ABC>` are also retained.
+User and channel references in the discussion viewer link to their Slack
+profiles and channels.
+
+To limit Slack API usage, the server loads the workspace user directory only
+when an unresolved handle needs it, using the reader token's existing
+`users:read` scope. All operators share one cursor-paginated load per server
+instance, with 200 users per page and at most 10 page requests per minute.
+Complete indexes, including unknown-handle results, are reused for 24 hours;
+unknown names do not force extra scans. There are no scans on startup, page
+loads, or keystrokes. The trade-off is that new or renamed handles (and account
+deactivations) may take up to 24 hours to appear. Explicit `<@USERID>` references
+and configured Chai/current-channel references do not require a directory scan.
+
+A cold or refreshing directory may take time to load in a large workspace. A
+send waits at most two seconds for that shared load, then returns a definite
+"no reply was posted" error with the draft retained. Loading continues in the
+background, but never sends a deferred reply: click **Post reply** again when
+ready. Directory loading does not hold the workflow/posting lock. Slack
+`Retry-After` delays are respected; failed loads have a shared 15-minute cooldown
+(or longer if Slack requires it). Loads stop at server shutdown and are bounded
+to 1,000 pages, 200,000 users, and two hours; incomplete indexes are never used.
+
+Unknown, ambiguous, or deactivated handle references are rejected before posting,
+with a readable error and the draft retained, rather than silently becoming
+ordinary text. Use an explicit reference from Slack if a recently added or
+renamed handle is not in the daily directory snapshot. Code blocks, inline code,
+escaped references, email addresses, URL fragments, and numeric issue references
+such as `#123` and `#123.` stay literal. User-group and broadcast mentions are not
+supported by this composer; use Slack for those deliberately wider notifications.
+
+New replies containing the reserved `OPS_ALERT_ACTION_V1` workflow-control marker
+are rejected rather than rewritten, so quoted text cannot become an action
+record when read by an older dashboard version. Existing Slack evidence remains
+visible without changing its text.
+Slack may normalize emoji and links when returning messages. Delivery records
+identify the original submission independently of that display formatting;
+edited messages keep their edited indicator and actual Slack sender identity.
+Legacy generic reply headers remain readable. Once attributed headers have been
+posted, rollback requires a version that recognizes those headers.
+Drafts survive closing the panel and normal dashboard refreshes, but private
+display state and drafts are cleared when authentication or operator identity
+changes.
+
+The exact request ID, text and destination are retained in per-operator session
+storage before posting. Retry is explicit and reuses that request; ambiguous
+delivery is never treated as a confirmed failure or automatically reposted.
+Retries of uncertain or restored requests only reconcile against confirmed
+archive evidence, including after a server restart. Confirmation is independent
+of pagination, so an older reply can be confirmed without reloading or reposting
+it. If confirmation is still
+unavailable, check the original Slack thread before explicitly discarding the
+retained request; discarding does not prove that the reply was not delivered.
+Reads and replies require the existing authorized proxy session, and replies
+also require matching Origin and the operator-bound CSRF token. Slack tokens
+are never exposed to the browser. The synthetic demo supports discussion loading
+and replies without contacting Slack.
 
 ## Unmerged bot PRs
 
@@ -264,6 +416,17 @@ Go regexp engine, show up to 200 current matching occurrences, and restrict scop
 to the selected channel and producer. Patterns match parsed source identifiers,
 not arbitrary message text. Regex requires a parsed identifier; individual actions
 do not. A stale revision is rejected before saving.
+
+The checkbox toolbar offers **Close selected**, **Snooze selected**, and
+**WIP selected**. Their dialogs default to exactly the checked occurrences. Switch
+to **Matching identifier regex** to edit a pattern for each selected source and
+channel. Each server preview includes other current matches in that source and
+channel, even outside the selection or current view. WIP and Snooze save one rule
+per source/channel and also cover future matches until the next **06:00 UTC**;
+Close freezes only the listed current matches. Regex is unavailable when a selected
+source/channel has no parsed identifier to anchor its pattern; exact selection
+still works. All selected actions retain their requests and progress for explicit
+recovery and preserve the current view and filters.
 
 Individual WIP stays assigned until released or closed. Regex WIP covers current
 and future matches until the next **06:00 UTC**; unfinished rule-owned occurrences
@@ -371,7 +534,8 @@ While the popup is open in a visible tab, it checks the shared conversation cach
 every five seconds. A bounded background worker refreshes interested threads at
 most once per ten seconds each, with one Slack thread read at a time. Interest
 expires after 30 seconds and is limited to eight threads; rate limits postpone
-reads. Full channel discovery continues at `--sync-interval` (one minute by
+reads. Open alert discussions share this targeted-read budget and thread cache.
+Full channel discovery continues at `--sync-interval` (one minute by
 default). This is polling with a short delay, not a streaming connection or a
 guarantee of a fixed response time. Minimized and hidden tabs stop chat polling.
 
@@ -408,7 +572,9 @@ the scan covers at most 72 hours. Buffer occurrences are hidden and cannot recei
 new actions. Current-day rules still expire at the next 06:00 UTC reset.
 Reconciliation rescans this bounded history (default every minute), rereading
 threads when reply counts or latest-reply timestamps change. Browser refreshes
-read memory every 15 seconds, not Slack. Config changes require a process restart.
+of the main dashboard snapshot read memory every 15 seconds, not Slack. Open
+Slack discussions additionally request targeted Slack refreshes as described
+above. Config changes require a process restart.
 
 Incomplete replay or malformed trusted action records expose Catching up/Degraded
 coverage and pause actions. Verify channel retention and full rebuild time before
@@ -433,9 +599,11 @@ The focused table-driven tests cover producer/classification trust, occurrence
 identity, scoped daily-reset WIP/Snooze and replay, stale/idempotent/uncertain
 writes, Chai thread binding, HTTP authorization/CSRF, Slack pagination, and complete
 GitHub search caching. Browser logic unit cases run with Node when available and
-cover personal unread state, notification deduplication, safe formatting, and
-explicit recovery of partial close batches. Tests use fixed clocks and in-memory
-transports. There is no integration or browser test framework.
+cover personal unread state, notification deduplication, safe formatting, alert
+name grouping, on-demand Slack discussions, and explicit recovery of partial
+close batches. Tests use fixed
+clocks and in-memory transports. There is no integration or browser test
+framework.
 
 Scoped workflow fields extend durable v1 records. New versions still read old
 records, but older binaries reject scoped fields during strict replay. Keep a

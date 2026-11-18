@@ -319,21 +319,12 @@ func validateTransition(o Occurrence, r actionRecord, cache serviceCache, histor
 }
 
 // reloadTarget reconciles confirmed request IDs before considering a new post.
+// The read stays mandatory: delivery proof is never satisfied by cache freshness.
 func (s *Service) reloadTarget(ctx context.Context, cache serviceCache, target Occurrence) (serviceCache, error) {
-	replies, err := s.archive.Replies(ctx, s.cfg.ChannelID, target.Identity.Timestamp)
+	updated, err := s.reloadThread(ctx, cache, target.Identity.Timestamp)
 	if err != nil {
 		return cache, fmt.Errorf("reloading target thread: %w", err)
 	}
-	threads := maps.Clone(cache.Threads)
-	thread := threads[target.Identity.Timestamp]
-	thread.Replies = replies
-	threads[target.Identity.Timestamp] = thread
-	updated, err := s.replay(threads, cache.Pending)
-	if err != nil {
-		return cache, err
-	}
-	updated.Coverage = cache.Coverage
-	updated.Decorations = cache.Decorations
 	return updated, nil
 }
 
@@ -427,11 +418,7 @@ func (s *Service) Act(ctx context.Context, actor string, req ActionRequest) (Occ
 		return s.failedDelivery(cache, target, record, err)
 	}
 	threads := maps.Clone(cache.Threads)
-	thread := threads[target.Identity.Timestamp]
-	thread.Replies = append(append([]slack.Message(nil), thread.Replies...), slack.Message{Msg: slack.Msg{Timestamp: ts, ThreadTimestamp: target.Identity.Timestamp, User: s.cfg.Writer.UserID, BotID: s.cfg.Writer.BotID, Text: message.Text, Metadata: message.Metadata}})
-	thread.Root.ReplyCount++
-	thread.Root.LatestReply = ts
-	threads[target.Identity.Timestamp] = thread
+	saveThreadReply(threads, target.Identity.Timestamp, ts, slack.Message{Msg: slack.Msg{Timestamp: ts, ThreadTimestamp: target.Identity.Timestamp, User: s.cfg.Writer.UserID, BotID: s.cfg.Writer.BotID, Text: message.Text, Metadata: message.Metadata}})
 	updated, err = s.replay(threads, cache.Pending)
 	if err != nil {
 		return target, s.degrade(cache, fmt.Errorf("replaying saved action: %w", err))

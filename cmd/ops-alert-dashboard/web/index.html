@@ -8,23 +8,25 @@
 <link rel="stylesheet" href="/style.css">
 <script src="/reports.js" defer></script>
 <script src="/chat.js" defer></script>
+<script src="/threads.js" defer></script>
 <script src="/app.js" defer></script>
 </head>
 <body>
 <header class="chrome"><span class="logo" aria-hidden="true">▦</span><div class="brand">Test Platform<small>OPERATIONS</small></div><span id="operator">Connecting…</span></header>
 <div id="demo" class="banner demo" hidden>Demo workspace · Synthetic Slack data. Actions affect this in-memory demo only.</div>
-<div class="app"><aside class="sidebar"><p class="eyebrow">Workspace</p><nav id="navigation" aria-label="Operations views"></nav><p class="side-note">Shared workflow<br>One card per Slack parent</p></aside>
+<div class="app"><nav id="navigation" aria-label="Operations views"></nav>
 <main id="main"><div class="page-head"><div><h1 id="title">Feed</h1><p id="subtitle" class="muted">Occurrences needing triage</p></div><div class="head-actions"><button id="mark-read" class="btn" type="button">Mark all read</button><button id="notifications" class="btn" type="button">Enable notifications</button><button id="refresh" class="btn" type="button">↻ Refresh</button></div></div>
 <section id="coverage" class="banner" role="status" aria-live="polite">Connecting to retained Slack history…</section>
 <div id="action-error" class="banner error" role="alert" hidden></div>
 <div id="retry-panel" class="banner warning" hidden><p id="retry-text"></p><button id="retry" class="btn" type="button">↻ Retry same request</button><button id="dismiss-expired" class="btn" type="button" hidden>Dismiss expired local retry</button></div>
-<p id="personal-status" class="fine" role="status"></p><div id="batch-panel" class="banner warning" hidden><p id="batch-text"></p><button id="resume-batch" class="btn" type="button">Resume frozen close plan</button><button id="cancel-batch" class="btn" type="button">Discard remaining close plan</button></div><p id="outcome" role="status" aria-live="polite"></p>
-<div class="toolbar"><label class="search">Search occurrences<input id="search" type="search" placeholder="Title, identifier, source or evidence…" autocomplete="off"></label><label id="color-label">Priority<select id="color"><option value="">All priorities</option><option value="red">Red</option><option value="orange">Orange</option><option value="yellow">Yellow</option></select></label></div>
+<p id="personal-status" class="fine" role="status"></p><div id="batch-panel" class="banner warning" hidden><p id="batch-text"></p><button id="resume-batch" class="btn" type="button">Resume frozen action plan</button><button id="cancel-batch" class="btn" type="button">Discard remaining action plan</button></div><p id="outcome" role="status" aria-live="polite"></p>
+<div class="toolbar"><label class="search">Search occurrences<input id="search" type="search" placeholder="Title, identifier, source or evidence…" autocomplete="off"></label><label id="color-label">Priority<select id="color"><option value="">All priorities</option><option value="red">Red</option><option value="orange">Orange</option><option value="yellow">Yellow</option></select></label><label id="grouping"><input id="group-by-name" type="checkbox"><span>Group by name</span></label></div>
 <div id="filters" class="filters" aria-label="Filter by category"></div>
 <div id="content"></div>
 <footer><span>Slack is the shared source of workflow history.</span><span>Workflow state does not establish source health · Times use your browser’s local time zone</span></footer>
 </main></div>
 <div id="chai-chat-root"></div>
-<dialog id="action-dialog" aria-labelledby="dialog-title"><form id="action-form"><div class="dialog-head"><h2 id="dialog-title"></h2><button class="btn" id="dialog-close" type="button" aria-label="Close preview">✕ Close</button></div><p id="dialog-context" class="muted"></p><fieldset id="scope-controls"><legend>Apply to</legend><label><input type="radio" name="scope" value="occurrence" checked> This occurrence</label><label><input type="radio" name="scope" value="regex"> Matching identifier regex</label></fieldset><label id="draft-label" for="draft"></label><textarea id="draft" required></textarea><div id="preview" class="preview" aria-live="polite"></div><p id="form-error" class="error-text" role="alert"></p><div class="actions"><button type="submit" class="btn primary" id="confirm"></button><button type="button" class="btn" id="cancel">Cancel</button></div></form></dialog>
+<div id="alert-thread-root"></div>
+<dialog id="action-dialog" aria-labelledby="dialog-title"><form id="action-form"><div class="dialog-head"><h2 id="dialog-title"></h2><button class="btn" id="dialog-close" type="button" aria-label="Close preview">✕ Close</button></div><p id="dialog-context" class="muted"></p><fieldset id="scope-controls"><legend>Apply to</legend><label><input type="radio" name="scope" value="occurrence" checked> <span id="scope-occurrence-label">This occurrence</span></label><label><input type="radio" name="scope" value="regex"> Matching identifier regex</label></fieldset><label id="draft-label" for="draft"></label><textarea id="draft" required></textarea><div id="selection-patterns" hidden></div><div id="preview" class="preview" aria-live="polite"></div><p id="form-error" class="error-text" role="alert"></p><div class="actions"><button type="submit" class="btn primary" id="confirm"></button><button type="button" class="btn" id="cancel">Cancel</button></div></form></dialog>
 </body>
 </html>

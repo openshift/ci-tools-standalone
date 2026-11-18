@@ -3,7 +3,7 @@
   const views = {feed: ['▤', 'Feed', 'Occurrences needing triage'], acknowledged: ['✓', 'WIP', 'Occurrences an operator is investigating'], snoozed: ['◷', 'Snoozed', 'Snoozed occurrences and matching rules with a fixed daily return'], closed: ['☑', 'Closed investigations', 'Completed investigations; source health is unchanged'], unmerged_prs: ['⑂', 'Unmerged PRs', 'Open pull requests from configured public repository bots'], chai_reports: ['✧', 'Chai reports', 'Scheduled findings, grouped by task with latest and history']};
   const categories = {cluster_fleet: 'Cluster fleet', cloud_cleanup: 'Cloud cleanup', ci_platform: 'CI platform', repo_automation: 'Repo automation', other: 'Other'};
   const el = id => document.getElementById(id);
-  const state = {snapshot: null, view: 'feed', category: '', selected: '', selectedReport: '', reportDisclosures: new Set(), query: '', color: '', fetching: false, sending: false, pending: null, pendingUnconfirmed: false, pendingUser: '', storageUser: null, storageError: '', dialogOccurrence: null, dialogKind: '', lastFocus: null, fetchError: '', authPaused: false, personal: null, personalUser: '', personalError: '', wasReady: false, previewVersion: 0, previewTargets: [], previewValid: false, dialogScope: 'occurrence', batch: null, prs: null, prsLoading: false, generation: 0};
+  const state = {snapshot: null, view: 'feed', category: '', selected: '', selectionVersion: 0, pendingSelection: null, pendingTargets: [], batchTargets: new Map(), checked: new Set(), selectedReport: '', reportDisclosures: new Set(), grouped: false, groupDisclosures: new Set(), query: '', color: '', fetching: false, sending: false, pending: null, pendingUnconfirmed: false, pendingUser: '', storageUser: null, storageError: '', dialogOccurrence: null, dialogTargets: [], dialogGroups: [], previewGroups: [], dialogKind: '', lastFocus: null, fetchError: '', authPaused: false, personal: null, personalUser: '', personalError: '', wasReady: false, previewVersion: 0, previewTargets: [], previewValid: false, dialogScope: 'occurrence', batch: null, prs: null, prsLoading: false, generation: 0};
   const desktopNotifications = new Set();
   const sopCache = new Map();
   const sopDisclosures = new Set();
@@ -14,6 +14,7 @@
   /** Use the browser's timezone rules so daylight-saving changes need no manual offset. */
   const date = value => { const d = new Date(value); return Number.isFinite(d.getTime()) ? new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'}).format(d) : 'Not available'; };
   const chaiChat = window.OpsChaiChat?.create({root: el('chai-chat-root'), renderBody: chatBody, formatDate: date, request: chatRequest, onAuthError: chatAuthenticationError});
+  const slackThread = window.OpsSlackThread?.create({root: el('alert-thread-root'), request: threadRequest, formatDate: date, channelName: () => channelName(), usergroups: () => state.snapshot?.usergroups || {}, onAuthError: chatAuthenticationError});
   /** Reuse the safe report renderer for conversational Markdown without interpreting HTML. */
   function chatBody(source, reference) { const body = node('div', null, 'report-body'); renderReportBody(body, source, reference); return body; }
   /** Keep chat writes on the same authenticated origin and server-derived actor as actions. */
@@ -24,6 +25,18 @@
     if (method === 'POST') { headers['Content-Type'] = 'application/json'; headers['X-CSRF-Token'] = state.snapshot?.csrf_token || ''; options.body = JSON.stringify(body); }
     const active = method === 'GET' && body?.conversation_id ? '?active=' + encodeURIComponent(body.conversation_id) : '';
     const response = await fetch('/api/conversations' + active, options);
+    const json = (response.headers.get('content-type') || '').includes('application/json');
+    if (generation !== state.generation || response.redirected || !json || response.status === 401 || response.status === 403) return {ok: false, status: 401, body: {error: 'Your authenticated session could not be verified.'}};
+    return {ok: response.ok, status: response.status, body: await response.json(), retryAfter: response.headers.get('retry-after')};
+  }
+  /** Keep original-thread reads and writes on the authenticated origin with the same session checks as chat. */
+  async function threadRequest(method, body, signal) {
+    const generation = state.generation;
+    const headers = {Accept: 'application/json'};
+    const options = {method, credentials: 'same-origin', cache: 'no-store', signal, headers};
+    if (method === 'POST') { headers['Content-Type'] = 'application/json'; headers['X-CSRF-Token'] = state.snapshot?.csrf_token || ''; options.body = JSON.stringify(body); }
+    const query = method === 'GET' && body?.occurrence_id ? '?occurrence_id=' + encodeURIComponent(body.occurrence_id) + (body.before ? '&before=' + encodeURIComponent(body.before) : '') + (body.refresh === true ? '&refresh=true' : '') : '';
+    const response = await fetch('/api/alert-thread' + query, options);
     const json = (response.headers.get('content-type') || '').includes('application/json');
     if (generation !== state.generation || response.redirected || !json || response.status === 401 || response.status === 403) return {ok: false, status: 401, body: {error: 'Your authenticated session could not be verified.'}};
     return {ok: response.ok, status: response.status, body: await response.json(), retryAfter: response.headers.get('retry-after')};
@@ -83,6 +96,25 @@
   const isReport = occurrence => occurrence.view === 'chai_reports' || occurrence.classification.category === 'chai_reports';
   const matchesSearch = occurrence => !state.query || [occurrence.message.title, occurrence.message.text, occurrence.message.source, ...(occurrence.message.identifiers || [])].join(' ').toLowerCase().includes(state.query.toLowerCase());
   const visible = () => sorted(items().filter(o => (state.view === 'chai_reports' ? isReport(o) : !isReport(o) && o.view === state.view) && (state.view === 'chai_reports' || ((!state.category || o.classification.category === state.category) && (!state.color || o.classification.color === state.color))) && matchesSearch(o)));
+  const openAlert = o => !isReport(o) && o.view !== 'closed' && !workflow(o).closed_by && !workflow(o).closed_at;
+  /** Selection belongs only to the currently visible open alerts. */
+  function pruneSelection() { const allowed = new Set(visible().filter(openAlert).map(id)); for (const value of state.checked) if (!allowed.has(value)) state.checked.delete(value); }
+  function selectionChanged() { state.selectionVersion++; state.pendingSelection = null; }
+  /** Preserve the operator's queue and move only the inspector that initiated this confirmed action. */
+  function actionSelection(request) {
+    const planned = state.batch?.requests[state.batch.index]?.request_id === request.request_id;
+    const affected = planned ? state.batchTargets.get(request.occurrence_id) || [request.occurrence_id] : state.pendingTargets.length ? state.pendingTargets : [request.occurrence_id];
+    const order = visible().map(id), selected = state.selected;
+    if (!selected || !affected.includes(selected) || !order.includes(selected)) return null;
+    return {selected, order, skip: planned ? [...state.batchTargets.values()].flat().concat(state.batch.requests.map(request => request.occurrence_id)) : affected, version: state.selectionVersion, generation: state.generation, scope: JSON.stringify([state.view, state.query, state.category, state.color])};
+  }
+  function advanceSelection(context) {
+    if (!context || state.pendingSelection !== context) return;
+    state.pendingSelection = null;
+    if (context.version !== state.selectionVersion || context.generation !== state.generation || context.scope !== JSON.stringify([state.view, state.query, state.category, state.color]) || (state.selected && state.selected !== context.selected)) return;
+    const remaining = new Set(visible().map(id)), index = context.order.indexOf(context.selected), skip = new Set(context.skip);
+    state.selected = context.order.slice(index + 1).concat(context.order.slice(0, index).reverse()).find(candidate => remaining.has(candidate) && !skip.has(candidate)) || '';
+  }
   /** Reject unsafe source links before they can become interactive DOM nodes. */
   function safeURL(value) {
     if (typeof value !== 'string' || /[\u0000-\u0020\\]/.test(value)) return null;
@@ -96,7 +128,8 @@
   const emoji = {rotating_light: '🚨', warning: '⚠️', eyes: '👀', zzz: '💤', white_check_mark: '✅', heavy_check_mark: '✔️', fire: '🔥', x: '❌', red_circle: '🔴', large_orange_circle: '🟠', large_yellow_circle: '🟡', information_source: 'ℹ️', rocket: '🚀', tada: '🎉', thumbsup: '👍', '+1': '👍', thumbsdown: '👎', '-1': '👎', hourglass_flowing_sand: '⏳', construction: '🚧', bell: '🔔', no_entry: '⛔', heart: '❤️', pray: '🙏', smile: '😄', bug: '🐛', robot_face: '🤖'};
   const decodeSlack = value => text(value).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
   const emojify = value => value.replace(/:([a-z0-9_+-]+):/g, (match, name) => emoji[name] || match);
-  const channelName = () => state.snapshot?.channel_name || 'Operations channel';
+  /** Hoisted declaration: the Slack thread controller renders once while being created, before later const helpers in this script are initialized. */
+  function channelName() { return state.snapshot?.channel_name || 'Operations channel'; }
   /** Produce readable title text without interpreting source markup as HTML. */
   function plainSlack(value) {
     return emojify(decodeSlack(value)).replace(/<([^>|]+)\|([^>]+)>/g, '$2').replace(/<(https:\/\/[^>]+)>/g, '$1').replace(/[*_~`]/g, '');
@@ -184,7 +217,7 @@
   }
   /** Restore preferences only for the current authenticated identity. */
   function loadPersonal(user) {
-    state.personalUser = user; state.personalError = ''; state.personal = defaultPersonal(); state.wasReady = false;
+    state.checked.clear(); state.personalUser = user; state.personalError = ''; state.personal = defaultPersonal(); state.wasReady = false;
     try {
       const saved = JSON.parse(localStorage.getItem(personalKey(user)) || 'null');
       if (saved && Array.isArray(saved.known) && Array.isArray(saved.read)) {
@@ -203,6 +236,35 @@
     if (!state.personal) return;
     state.personal.preferences = {view: state.view, category: state.category, color: state.color, query: state.query}; savePersonal();
   }
+  // Grouping is a cosmetic browser-wide choice, so it lives in a cookie instead of the per-user personal storage.
+  const groupingCookie = 'ops-alert-dashboard.group-by-name.v1';
+  const groupingCookieMaxAge = 31536000;
+  /** Read only a known grouping value; absent, malformed or blocked cookies mean the flat list. */
+  function readGroupedPreference() {
+    try {
+      for (const part of String(document.cookie).split(';')) {
+        const item = part.trim();
+        if (item.startsWith(groupingCookie + '=')) return decodeURIComponent(item.slice(groupingCookie.length + 1)) === 'true';
+      }
+    } catch { /* A blocked cookie store never blocks rendering. */ }
+    return false;
+  }
+  /** Persist the grouping choice for this browser; a blocked cookie never disables the toggle. */
+  function writeGroupedPreference(grouped) {
+    try {
+      const secure = window.location?.protocol === 'https:' ? '; Secure' : '';
+      document.cookie = groupingCookie + '=' + encodeURIComponent(grouped ? 'true' : 'false') + '; Max-Age=' + groupingCookieMaxAge + '; Path=/; SameSite=Lax' + secure;
+    } catch { /* The choice still applies to this page without persistence. */ }
+  }
+  /** Apply the stored grouping choice once when the dashboard loads. */
+  function loadGroupingPreference() { state.grouped = readGroupedPreference(); }
+  /** Switch between the flat and grouped alert list, persisting only the cosmetic choice. */
+  function toggleGrouping(grouped) {
+    state.grouped = grouped;
+    writeGroupedPreference(grouped);
+    render();
+  }
+  loadGroupingPreference();
   /** Keep personal reading independent of another operator changing workflow state. */
   function unread(o) { return !isReport(o) && state.personal && state.personal.known.includes(id(o)) && !state.personal.read.includes(id(o)); }
   /** Record an explicit reading action without acknowledging the shared alert. */
@@ -247,7 +309,7 @@
         localStorage.setItem(key, JSON.stringify([...prior].filter(value => retained.has(value))));
         const notification = new Notification(fresh.length === 1 ? displayTitle(fresh[0]) : fresh.length + ' new operations alerts', {body: fresh.length === 1 ? channelName() + ' · ' + fresh[0].message.source : channelName() + ' · Open Feed to triage', tag: 'ops-alert-dashboard-' + user});
         desktopNotifications.add(notification); notification.onclose = () => desktopNotifications.delete(notification);
-        notification.onclick = () => { window.focus(); state.view = 'feed'; state.selected = id(fresh[0]); render(); notification.close(); };
+        notification.onclick = () => { selectionChanged(); window.focus(); state.view = 'feed'; state.selected = id(fresh[0]); render(); notification.close(); };
       } catch { state.personalError = 'Desktop notification delivery or storage is unavailable.'; }
     });
   }
@@ -268,11 +330,12 @@
   /** Clear private display caches while preserving guarded requests for explicit recovery. */
   function pauseAuthentication(message) {
     closeDesktopNotifications();
-    state.authPaused = true; state.wasReady = false; state.generation++; state.snapshot = null; state.prs = null; state.selected = ''; state.selectedReport = '';
-    sopCache.clear(); metricsCache.clear(); sopDisclosures.clear(); metricsDisclosures.clear(); metricsSelections.clear(); state.reportDisclosures.clear();
+    state.authPaused = true; state.wasReady = false; state.generation++; state.snapshot = null; state.prs = null; state.selected = ''; state.checked.clear(); state.selectedReport = '';
+    sopCache.clear(); metricsCache.clear(); sopDisclosures.clear(); metricsDisclosures.clear(); metricsSelections.clear(); state.reportDisclosures.clear(); state.groupDisclosures.clear();
     if (el('action-dialog').open) closeDialog(); state.fetchError = message;
     document.title = 'Sign in · Test Platform Operations';
     chaiChat?.update(null);
+    slackThread?.update(null);
   }
   /** Recognize proxy sign-in responses before treating their HTML as dashboard data. */
   async function responseJSON(response) {
@@ -343,8 +406,8 @@
       state.pendingUnconfirmed = !!retained;
       const savedPlan = sessionStorage.getItem(batchKey(user));
       const plan = savedPlan ? JSON.parse(savedPlan) : null;
-      if (plan && !validBatch(plan, user)) throw new Error('The retained close plan is invalid.');
-      state.batch = plan;
+      if (plan && !validBatch(plan, user)) throw new Error('The retained action plan is invalid.');
+      state.batch = plan; state.batchTargets = new Map(); state.pendingTargets = [];
     } catch (err) {
       state.storageError = 'Cannot restore retained action requests. Actions are paused to prevent duplicate writes. ' + (err.message || 'Session storage is unavailable.');
     }
@@ -411,7 +474,7 @@
   function renderNav() {
     el('navigation').replaceChildren();
     for (const [key, view] of Object.entries(views)) {
-      const b = button(view[0] + ' ' + view[1], () => { state.view = key; state.category = ''; state.selected = ''; error(''); rememberPreferences(); if (key === 'unmerged_prs') refreshPRs(); render(); }, key === 'chai_reports' ? 'report-nav' : '');
+      const b = button(view[0] + ' ' + view[1], () => { selectionChanged(); state.view = key; state.category = ''; state.selected = ''; error(''); rememberPreferences(); if (key === 'unmerged_prs') refreshPRs(); render(); }, key === 'chai_reports' ? 'report-nav' : '');
       if (state.view === key) b.setAttribute('aria-current', 'page');
       if (key === 'feed') {
         const feed = items().filter(o => !isReport(o) && o.view === 'feed'), count = feed.filter(unread).length;
@@ -427,44 +490,120 @@
     el('filters').replaceChildren();
     el('filters').hidden = ['chai_reports', 'unmerged_prs'].includes(state.view);
     el('color-label').hidden = ['chai_reports', 'unmerged_prs'].includes(state.view);
+    el('grouping').hidden = ['chai_reports', 'unmerged_prs'].includes(state.view);
     el('search').closest('label').hidden = state.view === 'unmerged_prs';
+    el('group-by-name').checked = state.grouped;
     for (const [key, label] of Object.entries(categories)) {
-      const b = button('', () => { state.category = state.category === key ? '' : key; rememberPreferences(); render(); }, 'filter');
+      const b = button('', () => { selectionChanged(); state.category = state.category === key ? '' : key; rememberPreferences(); render(); }, 'filter');
       b.setAttribute('aria-pressed', String(state.category === key));
       append(b, node('span', label), node('strong', items().filter(o => !isReport(o) && o.view === state.view && o.classification.category === key).length));
       el('filters').append(b);
     }
   }
-  /** Refresh the visible snapshot without marking an automatically selected alert as read. */
+  /** Refresh the visible snapshot without opening details or marking alerts as read. */
   function render() {
     renderStatus(); renderBatch(); renderNav(); renderFilters();
     if (!state.authPaused) { const count = items().filter(o => o.view === 'feed' && unread(o)).length; document.title = (count ? '(' + count + ') ' : '') + 'Test Platform · Operations'; }
     el('title').textContent = views[state.view][1]; el('subtitle').textContent = views[state.view][2];
-    const content = el('content'); content.replaceChildren();
+    pruneSelection();
+    const content = el('content'); rememberGroupDisclosures(content); content.replaceChildren();
     if (!state.snapshot) { content.append(node('p', state.authPaused ? 'Sign in again to reload your operations workspace. Pending action requests stay in this browser session and are never replayed automatically.' : 'Waiting for the first snapshot…', 'empty')); return; }
     if (state.view === 'unmerged_prs') { renderPRs(content); return; }
     const list = visible();
     if (state.view === 'chai_reports') { renderReports(content, sorted(items().filter(isReport))); return; }
-    if (!list.some(o => id(o) === state.selected)) state.selected = list[0] ? id(list[0]) : '';
-    const workspace = node('div', null, 'workspace');
-    const listBox = node('section', null, 'list'); listBox.setAttribute('aria-label', 'Alert occurrences');
-    append(listBox, append(node('div', null, 'list-head'), node('span', list.length + ' occurrence' + (list.length === 1 ? '' : 's')), node('span', 'Latest report first')));
-    const cards = node('div', null, 'list-items');
+    renderAlerts(content, list);
+  }
+  /** Grouping key: the first parsed identifier, or the readable title when none was parsed. */
+  function alertGroupName(o) {
+    return text((o.message.identifiers || [])[0]) || displayTitle(o);
+  }
+  /** Group the filtered occurrences by name in input order; a Map keeps hostile keys like __proto__ distinct. */
+  function groupAlerts(list) {
+    const groups = new Map();
     for (const o of list) {
-      const b = button('', () => { state.selected = id(o); markRead(o); render(); }, 'alert-card ' + o.classification.color + (unread(o) ? ' unread' : ''));
-      b.setAttribute('aria-pressed', String(id(o) === state.selected));
-      append(b, append(node('span', null, 'row-top'), badge(o), unread(o) ? node('span', 'NEW', 'new-indicator') : null, sourceStatus(o) ? node('span', sourceStatus(o), 'source-status') : null, node('small', categories[o.classification.category] || 'Other')), node('strong', displayTitle(o)), identifierSubtitle(displayTitle(o), o.message.identifiers), append(node('span', null, 'row-meta'), node('span', o.message.source), node('time', date(o.message.reported_at))));
-      if (workflow(o).acknowledged_by) b.append(node('span', 'WIP · ' + workflow(o).acknowledged_by, 'identifier'));
-      if (o.snooze) b.append(node('span', 'Snoozed until ' + date(o.snooze.until), 'identifier'));
-      if (o.investigation) b.append(node('span', 'Chai · ' + statusLabel(o.investigation.status), 'identifier'));
-      cards.append(b);
+      const name = alertGroupName(o);
+      if (!groups.has(name)) groups.set(name, []);
+      groups.get(name).push(o);
     }
+    return groups;
+  }
+  /** One occurrence row: its optional selection checkbox plus the inspector card. */
+  function alertRow(o) {
+    const row = node('div', null, 'alert-row' + (o.classification.color ? ' ' + o.classification.color : ''));
+    if (openAlert(o)) {
+      const check = node('input'); check.id = 'select-alert-' + id(o); check.type = 'checkbox'; check.checked = state.checked.has(id(o)); check.setAttribute('aria-label', 'Select ' + displayTitle(o));
+      check.addEventListener('change', () => { if (check.checked) state.checked.add(id(o)); else state.checked.delete(id(o)); render(); el(check.id)?.focus(); }); row.append(check);
+    }
+    const b = button('', () => { selectionChanged(); state.selected = state.selected === id(o) ? '' : id(o); if (state.selected) markRead(o); render(); el(state.selected ? 'inspector-close' : 'alert-card-' + id(o))?.focus(); }, 'alert-card ' + o.classification.color + (unread(o) ? ' unread' : ''));
+    b.id = 'alert-card-' + id(o);
+    b.setAttribute('aria-pressed', String(id(o) === state.selected));
+    append(b, append(node('span', null, 'row-top'), badge(o), unread(o) ? node('span', 'NEW', 'new-indicator') : null, sourceStatus(o) ? node('span', sourceStatus(o), 'source-status') : null, node('small', categories[o.classification.category] || 'Other')), node('strong', displayTitle(o)), identifierSubtitle(displayTitle(o), o.message.identifiers), append(node('span', null, 'row-meta'), node('span', o.message.source), node('time', date(o.message.reported_at))));
+    if (workflow(o).acknowledged_by) b.append(node('span', 'WIP · ' + workflow(o).acknowledged_by, 'identifier'));
+    if (o.snooze) b.append(node('span', 'Snoozed until ' + date(o.snooze.until), 'identifier'));
+    if (o.investigation) b.append(node('span', 'Chai · ' + statusLabel(o.investigation.status), 'identifier'));
+    append(row, b);
+    return row;
+  }
+  /** Collapse same-name occurrences behind one native disclosure while keeping every row and action. Groups with personally unread members render first; the stable sort keeps each section in the list's newest-first order. */
+  function appendGroupedRows(cards, list) {
+    const groups = [...groupAlerts(list)].map(([name, members]) => ({name, members, fresh: members.filter(unread).length}));
+    groups.sort((left, right) => (right.fresh > 0) - (left.fresh > 0));
+    for (const {name, members, fresh} of groups) {
+      const group = node('details', null, 'alert-group');
+      group.dataset.name = name;
+      group.dataset.generation = state.generation;
+      group.open = state.groupDisclosures.has(name);
+      append(group, append(node('summary'), node('strong', name), node('span', members.length + ' occurrence' + (members.length === 1 ? '' : 's'), 'count'), fresh ? node('span', fresh + ' new', 'new-indicator') : null));
+      const rows = node('div', null, 'group-items');
+      for (const o of members) rows.append(alertRow(o));
+      group.append(rows);
+      cards.append(group);
+    }
+  }
+  /** Snapshot live disclosures just before a rerender replaces the groups. Reading the nodes directly avoids toggle callbacks, which can fire after replacement or an identity reset, and the generation guard keeps a stale tree from reviving cleared state. */
+  function rememberGroupDisclosures(content) {
+    for (const group of content.querySelectorAll('.alert-group')) {
+      if (Number(group.dataset.generation) !== state.generation) continue;
+      if (group.open) state.groupDisclosures.add(group.dataset.name);
+      else state.groupDisclosures.delete(group.dataset.name);
+    }
+  }
+  /** Keep selection and inspection independent, with details opened only by an explicit click. */
+  function renderAlerts(content, list) {
+    pruneSelection();
+    if (!list.some(o => id(o) === state.selected)) state.selected = '';
+    const workspace = node('div', null, 'workspace' + (state.selected ? ' with-inspector' : ''));
+    const listBox = node('section', null, 'list'); listBox.setAttribute('aria-label', 'Alert occurrences');
+    append(listBox, append(node('div', null, 'list-head'), node('span', list.length + ' occurrence' + (list.length === 1 ? '' : 's')), node('span', state.grouped ? 'Groups with new alerts first' : 'Latest report first')));
+    const selectable = list.filter(openAlert);
+    if (selectable.length) {
+      const toolbar = node('div', null, 'bulk-actions');
+      const all = node('input'); all.id = 'select-all-alerts'; all.type = 'checkbox'; all.checked = state.checked.size === selectable.length; all.indeterminate = state.checked.size > 0 && !all.checked;
+      all.setAttribute('aria-label', 'Select all matching open alerts');
+      all.addEventListener('change', () => { state.checked = all.checked ? new Set(selectable.map(id)) : new Set(); render(); el('select-all-alerts')?.focus(); });
+      const label = append(node('label'), all, node('span', 'Select all matching open alerts'));
+      const clear = button('Clear selection', () => { state.checked.clear(); render(); }); clear.disabled = !state.checked.size;
+      append(toolbar, label, clear);
+      for (const [kind, title] of [['close', 'Close'], ['snooze', 'Snooze'], ['acknowledge', 'WIP']]) {
+        const control = button(title + ' selected (' + state.checked.size + ')', () => openSelectedAction(kind));
+        control.disabled = !state.checked.size || !ready(); toolbar.append(control);
+      }
+      listBox.append(toolbar);
+    }
+    const cards = node('div', null, 'list-items');
+    if (state.grouped) appendGroupedRows(cards, list);
+    else for (const o of list) cards.append(alertRow(o));
     if (!list.length) cards.append(node('p', 'No occurrences match this view and these filters.', 'empty'));
     listBox.append(cards);
-    const detail = node('section', null, 'inspector'); detail.setAttribute('aria-label', 'Selected occurrence details');
+    workspace.append(listBox);
     const selected = list.find(o => id(o) === state.selected);
-    if (selected) renderDetail(detail, selected); else detail.append(node('p', 'Choose another view or clear the filters to inspect an occurrence.', 'empty'));
-    append(workspace, listBox, detail); content.append(workspace);
+    if (selected) {
+      const detail = node('section', null, 'inspector'); detail.setAttribute('aria-label', 'Selected occurrence details');
+      const close = button('Close details', () => { selectionChanged(); state.selected = ''; render(); el('alert-card-' + id(selected))?.focus(); }, 'btn inspector-close'); close.id = 'inspector-close';
+      detail.append(close);
+      renderDetail(detail, selected); workspace.append(detail);
+    }
+    content.append(workspace);
   }
   /** Bind each explicit action control to its displayed occurrence and selected scope. */
   function action(label, kind, occurrence, scope = 'occurrence') {
@@ -496,7 +635,9 @@
       else actions.append(action('◷ Snooze', 'snooze', o));
       actions.append(action('☑ Close investigation', 'close', o));
     }
-    const ask = button('✧ Ask Chai', () => chaiChat ? chaiChat.open({occurrenceID: id(o), title: displayTitle(o)}) : openDialog('investigate', o)); ask.disabled = !state.snapshot || state.authPaused; actions.append(ask); container.append(actions);
+    const ask = button('✧ Ask Chai', () => chaiChat ? chaiChat.open({occurrenceID: id(o), title: displayTitle(o)}) : openDialog('investigate', o)); ask.disabled = !state.snapshot || state.authPaused; actions.append(ask);
+    // Loading the original discussion is isolated from reading state, selection and workflow actions.
+    const discussion = button('💬 Load Slack conversation', () => slackThread?.open({occurrenceID: id(o), title: displayTitle(o), slackURL: o.message.slack_url})); discussion.id = 'thread-open-' + id(o); discussion.disabled = !state.snapshot || state.authPaused; actions.append(discussion); container.append(actions);
     container.append(node('p', ready() ? 'Actions are saved in this Slack thread before the dashboard confirms them.' : state.pending ? 'Resolve the unconfirmed request before creating another action.' : 'Actions are available when coverage is ready and the snapshot is current.', 'fine'));
     renderSOPs(container, o);
     renderMetrics(container, o);
@@ -1070,6 +1211,8 @@
   /** Require a visible confirmation scope before creating a workflow request. */
   function openDialog(kind, occurrence) {
     if (!ready() || (kind === 'investigate' && outstandingInvestigation(occurrence))) return;
+    state.dialogTargets = []; state.dialogGroups = []; state.previewGroups = []; el('selection-patterns').replaceChildren(); el('selection-patterns').hidden = true;
+    el('scope-occurrence-label').textContent = 'This occurrence';
     state.dialogKind = kind; state.dialogOccurrence = occurrence; state.dialogScope = 'occurrence'; state.lastFocus = document.activeElement;
     el('dialog-title').textContent = actionLabels[kind] + ' · preview';
     el('dialog-context').textContent = displayTitle(occurrence) + ' · ' + occurrence.message.source + ' · ' + channelName();
@@ -1080,8 +1223,38 @@
     el('confirm').textContent = actionLabels[kind]; el('form-error').textContent = '';
     updatePreview(); el('action-dialog').showModal(); el(kind === 'investigate' ? 'draft' : 'confirm').focus();
   }
+  /** Freeze every checked occurrence before presenting an exact action plan. */
+  function openSelectedAction(kind) {
+    if (!batchKinds.includes(kind)) return;
+    pruneSelection();
+    const targets = visible().filter(o => state.checked.has(id(o)) && openAlert(o)).map(freezeTarget);
+    if (!ready() || !targets.length) return;
+    if (targets.length > 10000) { error('Choose between 1 and 10,000 occurrences for one ' + batchLabel(kind) + ' plan. Narrow the filters or selection and try again.'); return; }
+    openDialog(kind, targets[0]);
+    state.dialogScope = 'selected'; state.dialogTargets = targets;
+    const groups = new Map();
+    for (const target of targets) { const key = JSON.stringify([target.identity.channel, target.message.source]); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(target); }
+    state.dialogGroups = [...groups.values()].map(members => {
+      const anchor = members.find(target => target.message.identifiers?.length && !selectionConflict(kind, target, true));
+      const identifiers = [...new Set(members.flatMap(target => target.message.identifiers || []))];
+      return {anchor, channel: members[0].identity.channel, source: members[0].message.source, pattern: '^(?:' + identifiers.map(escapeRegex).join('|') + ')$'};
+    });
+    el('scope-controls').hidden = false; el('scope-occurrence-label').textContent = 'Selected occurrences';
+    for (const input of document.querySelectorAll('input[name="scope"]')) { input.checked = input.value === 'occurrence'; input.disabled = input.value === 'regex' && state.dialogGroups.some(group => !group.anchor); }
+    const patterns = el('selection-patterns'); patterns.replaceChildren();
+    for (const group of state.dialogGroups) {
+      const field = node('textarea'); field.value = group.pattern; field.maxLength = 512;
+      field.setAttribute('aria-label', 'Identifier regex for channel ' + channelName() + ' / source ' + group.source);
+      field.addEventListener('input', () => { group.pattern = field.value.trim(); updatePreview(); });
+      patterns.append(append(node('label'), node('span', 'Channel ' + channelName() + ' / source ' + group.source + (group.anchor ? ' · anchor ' + displayTitle(group.anchor) : ' · no eligible parsed anchor')), field));
+    }
+    el('dialog-context').textContent = targets.length + ' selected open alert(s) · choose exact occurrences or matching rules';
+    updatePreview();
+  }
+  function openSelectedClose() { return openSelectedAction('close'); }
+  const freezeTarget = target => ({...target, identity: {...target.identity}, message: {...target.message, identifiers: [...(target.message.identifiers || [])]}});
   /** Invalidate in-flight previews so a closed dialog cannot receive stale targets. */
-  function closeDialog() { state.previewVersion++; el('action-dialog').close(); state.dialogOccurrence = null; state.previewTargets = []; state.previewValid = false; state.lastFocus?.focus(); }
+  function closeDialog() { state.previewVersion++; el('action-dialog').close(); state.dialogOccurrence = null; state.dialogTargets = []; state.dialogGroups = []; state.previewGroups = []; state.previewTargets = []; state.previewValid = false; state.lastFocus?.focus(); }
   /** Match the server's UTF-8 input limit before retaining a new request. */
   function chaiQuestionError(question) {
     if (!question) return 'Enter a question for Chai before sending.';
@@ -1092,16 +1265,21 @@
     const o = state.dialogOccurrence; if (!o) return;
     const version = ++state.previewVersion, kind = state.dialogKind, scope = state.dialogScope, draft = el('draft').value.trim();
     const investigate = kind === 'investigate', regex = scope === 'regex' && !investigate;
-    el('draft').hidden = !(investigate || regex); el('draft-label').hidden = !(investigate || regex);
-    el('draft').required = investigate || regex;
+    const grouped = state.dialogTargets.length > 0;
+    el('selection-patterns').hidden = !(grouped && regex);
+    el('draft').hidden = !(investigate || (regex && !grouped)); el('draft-label').hidden = !(investigate || (regex && !grouped));
+    el('draft').required = investigate || (regex && !grouped);
     el('draft-label').textContent = investigate ? 'Question for Chai' : 'Identifier regular expression (RE2 syntax)';
-    state.previewValid = false; state.previewTargets = []; el('confirm').disabled = true;
+    state.previewValid = false; state.previewTargets = []; state.previewGroups = []; el('confirm').disabled = true;
+    el('form-error').textContent = '';
+    if (grouped && regex) return updateSelectionRegex(version, kind);
+    if (grouped && state.dialogTargets.some(target => selectionConflict(kind, target))) { el('form-error').textContent = 'Some selected alerts already have this state. Uncheck them before confirming this exact plan, or choose a matching regex rule.'; return; }
     if (investigate) {
       el('preview').textContent = 'DPTP-bot → configured Chai identity\nDestination: the selected source thread in ' + channelName();
       el('form-error').textContent = chaiQuestionError(draft);
       state.previewValid = !el('form-error').textContent; el('confirm').disabled = !state.previewValid; return;
     }
-    let targets = [o], until = date(nextSix());
+    let targets = scope === 'selected' ? state.dialogTargets : [o], until = date(nextSix());
     if (regex) {
       if ((state.dialogKind === 'investigate' || state.dialogScope === 'regex') && !draft) { el('preview').textContent = 'Enter an identifier regex to preview matching occurrences.'; return; }
       el('preview').textContent = 'Loading matching occurrences from the server…';
@@ -1117,24 +1295,56 @@
       } catch (err) { if (version === state.previewVersion) el('preview').textContent = err.message || 'Preview unavailable.'; return; }
     }
     if (version !== state.previewVersion) return;
-    state.previewTargets = targets; state.previewValid = targets.length > 0;
+    state.previewTargets = targets.map(freezeTarget); state.previewValid = targets.length > 0;
     const deadline = kind === 'close' ? 'Only the frozen occurrences listed below will be closed. Future matches are not closed.' : kind === 'acknowledge' && !regex ? 'Work remains in progress until released.' : (kind === 'snooze' ? 'Snooze' : 'Matching WIP rule') + ' ends ' + until + '. The server computes the exact deadline.';
     const future = regex && kind !== 'close' ? '\nMatching current and future occurrences share this rule until expiry.' : '';
-    el('preview').textContent = 'Scope: ' + channelName() + ' / source ' + o.message.source + (regex ? '\nPattern: ' + draft : '\nThis occurrence only') + '\n' + deadline + future + '\n\n' + targets.length + ' current occurrence(s):\n' + targets.map(target => '• ' + displayTitle(target) + ' · ' + date(target.message.reported_at)).join('\n');
+    el('preview').textContent = (scope === 'selected' ? 'Scope: exact selected occurrences across their listed channels and sources' : 'Scope: ' + channelName() + ' / source ' + o.message.source + (regex ? '\nPattern: ' + draft : '\nThis occurrence only')) + '\n' + deadline + future + '\n\n' + targets.length + ' current occurrence(s):\n' + targets.map(target => '• ' + displayTitle(target) + ' · ' + date(target.message.reported_at) + (kind === 'close' || scope === 'selected' ? ' · channel ' + channelName() + ' / source ' + target.message.source : '')).join('\n');
+    if (grouped && state.dialogGroups.some(group => !group.anchor)) el('form-error').textContent = 'Matching regex is unavailable: each channel/source group needs a selected eligible alert with parsed identifiers. Exact selected actions remain available.';
     el('confirm').disabled = !state.previewValid;
   }
+  const selectionConflict = (kind, target, regex = false) => kind === 'snooze' ? !!target.snooze : kind === 'acknowledge' && !regex ? !!workflow(target).acknowledged_at && !target.wip_rule : false;
+  /** Preview each real server scope independently; never approximate RE2 matches in JavaScript. */
+  async function updateSelectionRegex(version, kind) {
+    const groups = state.dialogGroups.map(group => ({...group, anchor: group.anchor && freezeTarget(group.anchor)}));
+    el('preview').textContent = 'Loading matching occurrences for each selected channel and source…';
+    try {
+      if (!groups.length || groups.some(group => !group.anchor)) throw new Error('Each channel/source group needs a selected eligible alert with parsed identifiers.');
+      const previews = [];
+      for (const group of groups) {
+        if (!group.pattern || new TextEncoder().encode(group.pattern).length > 512) throw new Error('Enter an identifier regex of at most 512 UTF-8 bytes for every group.');
+        const response = await fetch('/api/action-preview', {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json', Accept: 'application/json', 'X-CSRF-Token': state.snapshot?.csrf_token || ''}, body: JSON.stringify({occurrence_id: id(group.anchor), kind, pattern: group.pattern})});
+        const result = await responseJSON(response);
+        if (version !== state.previewVersion || state.authPaused) return;
+        if (!response.ok) throw new Error(result.error || 'A selected scope could not be previewed.');
+        if (!Array.isArray(result.occurrences) || !result.occurrences.length || !result.occurrences.some(target => target.identity?.id === id(group.anchor)) || result.occurrences.some(target => !target.identity?.id || !target.identity?.revision || target.identity.channel !== group.channel || target.message?.source !== group.source || isReport(target)) || new Set(result.occurrences.map(id)).size !== result.occurrences.length) throw new Error('The server returned an invalid selected scope preview.');
+        previews.push({...group, targets: result.occurrences.map(freezeTarget), until: result.until ? date(result.until) : date(nextSix())});
+      }
+      if (version !== state.previewVersion || state.authPaused) return;
+      state.previewGroups = previews;
+      state.previewTargets = previews.flatMap(group => group.targets);
+      state.previewValid = state.previewTargets.length > 0 && state.previewTargets.length <= 10000;
+      el('preview').textContent = (kind === 'close' ? 'Only these frozen current matches will be closed. Future matches are not closed.' : 'Matching current and future occurrences share one rule per listed channel/source until expiry.') + '\n\n' + previews.map(group => 'Channel ' + channelName() + ' / source ' + group.source + '\nAnchor: ' + displayTitle(group.anchor) + '\nPattern: ' + group.pattern + (kind === 'close' ? '' : '\nExpires: ' + group.until) + '\n' + group.targets.length + ' current occurrence(s):\n' + group.targets.map(target => '• ' + displayTitle(target) + ' · ' + date(target.message.reported_at)).join('\n')).join('\n\n');
+      if (!state.previewValid) el('form-error').textContent = 'Choose between 1 and 10,000 current matches before confirming.';
+      el('confirm').disabled = !state.previewValid;
+    } catch (err) { if (version === state.previewVersion) el('preview').textContent = err.message || 'Preview unavailable.'; }
+  }
   function batchKey(user) { return 'ops-alert-dashboard.close-plan.v1.' + encodeURIComponent(user); }
-  /** Recover only a frozen sequence of supported per-occurrence close requests. */
+  const batchKinds = ['close', 'acknowledge', 'snooze'];
+  const batchLabel = kind => ({close: 'close', acknowledge: 'WIP', snooze: 'snooze'})[kind] || 'action';
+  /** Recover bounded homogeneous exact requests, including legacy close plans without scope. */
   function validBatch(plan, user) {
-    return plan && plan.user === user && Array.isArray(plan.requests) && plan.requests.length > 0 && plan.requests.length <= 10000 && Number.isInteger(plan.index) && plan.index >= 0 && plan.index <= plan.requests.length && plan.requests.every(request => validPending(request) && request.kind === 'close' && (!request.scope || request.scope === 'occurrence')) && new Set(plan.requests.map(request => request.request_id)).size === plan.requests.length;
+    if (!plan || typeof user !== 'string' || !user || plan.user !== user || !Array.isArray(plan.requests) || !plan.requests.length || plan.requests.length > 10000 || !Number.isInteger(plan.index) || plan.index < 0 || plan.index > plan.requests.length) return false;
+    const kind = plan.requests[0]?.kind, regex = plan.requests[0]?.scope === 'regex';
+    return batchKinds.includes(kind) && plan.requests.every(request => validPending(request) && request.kind === kind && (regex ? kind !== 'close' && request.scope === 'regex' && typeof request.pattern === 'string' && !!request.pattern && new TextEncoder().encode(request.pattern).length <= 512 : (request.scope === 'occurrence' || (kind === 'close' && !request.scope)) && !('pattern' in request)) && !('question' in request)) && new Set(plan.requests.map(request => request.request_id)).size === plan.requests.length && new Set(plan.requests.map(request => request.occurrence_id)).size === plan.requests.length;
   }
   /** Save batch progress before further writes so interruption cannot silently recreate requests. */
   function retainBatch(plan) {
+    if (!validBatch(plan, plan?.user)) { error('The frozen action plan is invalid.'); return false; }
     try {
       const saved = JSON.stringify(plan); sessionStorage.setItem(batchKey(plan.user), saved);
-      if (sessionStorage.getItem(batchKey(plan.user)) !== saved) throw new Error('Close plan was not retained.');
+      if (sessionStorage.getItem(batchKey(plan.user)) !== saved) throw new Error('Action plan was not retained.');
       state.batch = plan; return true;
-    } catch { state.storageError = 'The frozen close plan could not be saved. Actions are paused to prevent duplicate writes.'; error(''); return false; }
+    } catch { state.storageError = 'The frozen action plan could not be saved. Actions are paused to prevent duplicate writes.'; error(''); return false; }
   }
   /** Advance the frozen plan only after its exact request is confirmed. */
   function finishBatchRequest(request) {
@@ -1142,14 +1352,14 @@
     if (!plan || plan.requests[plan.index]?.request_id !== request.request_id) return;
     retainBatch({...plan, index: plan.index + 1});
   }
-  /** Discard only unissued batch intent without undoing already confirmed closes. */
+  /** Discard only unissued batch intent without undoing already confirmed actions. */
   function discardBatch() {
     if (!state.batch || state.sending || state.pending || state.batch.user !== state.snapshot?.user) return;
     try {
       sessionStorage.removeItem(batchKey(state.batch.user));
-      if (sessionStorage.getItem(batchKey(state.batch.user)) !== null) throw new Error('Close plan was not removed.');
+      if (sessionStorage.getItem(batchKey(state.batch.user)) !== null) throw new Error('Action plan was not removed.');
       state.batch = null; render();
-    } catch { state.storageError = 'The close plan could not be removed. Restore session storage before creating actions.'; error(''); }
+    } catch { state.storageError = 'The action plan could not be removed. Restore session storage before creating actions.'; error(''); }
   }
   /** Keep interrupted bulk progress and explicit recovery controls visible. */
   function renderBatch() {
@@ -1157,19 +1367,19 @@
     const unavailable = plan && plan.index < plan.requests.length && !items().some(o => id(o) === plan.requests[plan.index].occurrence_id);
     el('batch-panel').hidden = !plan || !authorized;
     if (!plan || !authorized) return;
-    el('batch-text').textContent = plan.index + ' of ' + plan.requests.length + ' frozen close requests confirmed. ' + (plan.index === plan.requests.length ? 'Plan complete.' : unavailable ? 'The next frozen occurrence is outside the retained snapshot. Discard the remaining plan after resolving any retained request.' : state.pending ? 'Resolve the retained request before continuing. No requests are replayed automatically.' : 'Review the current state, then explicitly resume to send the remaining frozen requests. A conflict stops the plan.');
+    el('batch-text').textContent = plan.index + ' of ' + plan.requests.length + ' frozen ' + batchLabel(plan.requests[0].kind) + ' requests confirmed. ' + (plan.index === plan.requests.length ? 'Plan complete.' : unavailable ? 'The next frozen occurrence is outside the retained snapshot. Discard the remaining plan after resolving any retained request.' : state.pending ? 'Resolve the retained request before continuing. No requests are replayed automatically.' : 'Review the current state, then explicitly resume to send the remaining frozen requests. A conflict stops the plan.');
     el('resume-batch').disabled = state.authPaused || state.sending || !!state.fetchError || !!state.storageError || state.snapshot?.status?.phase !== 'ready' || plan.index >= plan.requests.length || unavailable;
-    el('cancel-batch').disabled = state.sending || !!state.pending; el('cancel-batch').textContent = plan.index === plan.requests.length ? 'Dismiss completed plan' : 'Discard remaining close plan';
+    el('cancel-batch').disabled = state.sending || !!state.pending; el('cancel-batch').textContent = plan.index === plan.requests.length ? 'Dismiss completed plan' : 'Discard remaining ' + batchLabel(plan.requests[0].kind) + ' plan';
   }
-  /** Issue closes sequentially and stop immediately when confirmation or concurrency is uncertain. */
+  /** Issue actions sequentially and stop immediately when confirmation or concurrency is uncertain. */
   async function resumeBatch() {
     const plan = state.batch;
-    if (!plan || plan.user !== state.snapshot?.user || state.authPaused || state.sending || state.storageError || state.fetchError || state.snapshot?.status?.phase !== 'ready') return;
+    if (!validBatch(plan, state.snapshot?.user) || state.authPaused || state.sending || state.storageError || state.fetchError || state.snapshot?.status?.phase !== 'ready') return;
     while (state.batch && state.batch.index < state.batch.requests.length) {
       if (state.authPaused || state.sending || state.storageError || state.fetchError || state.snapshot?.status?.phase !== 'ready' || state.snapshot.user !== plan.user) break;
       const request = state.batch.requests[state.batch.index];
       if (!items().some(o => id(o) === request.occurrence_id)) { error('The next frozen occurrence is outside the retained snapshot. Resolve the retained request or discard the remaining plan.'); break; }
-      if (state.pending && state.pending.request_id !== request.request_id) { error('Resolve the retained request before resuming this plan.'); break; }
+      if (state.pending && (state.pending.request_id !== request.request_id || Object.keys(state.pending).length !== Object.keys(request).length || Object.keys(request).some(key => state.pending[key] !== request[key]))) { error('Resolve the retained request before resuming this plan.'); break; }
       if (!state.pending) {
         if (!retainPending(plan.user, request)) break;
         state.pending = request; state.pendingUser = plan.user; state.pendingUnconfirmed = false;
@@ -1180,42 +1390,58 @@
     }
     render();
   }
-  /** Freeze preview identities and revisions so future alerts never join an existing close plan. */
-  function startCloseBatch(targets) {
+  /** Retain only frozen identities and revisions; arrivals cannot join a confirmed plan. */
+  function startActionBatch(kind, targets) {
+    if (!batchKinds.includes(kind)) { error('This action does not support an exact plan.'); return; }
+    if (!Array.isArray(targets) || !targets.length || targets.length > 10000) { error('Choose between 1 and 10,000 occurrences for one ' + batchLabel(kind) + ' plan. Narrow the filters or selection and try again.'); return; }
     if (!ready() || !globalThis.crypto?.randomUUID) return;
-    const plan = {user: state.snapshot.user, index: 0, requests: targets.map(target => ({occurrence_id: id(target), kind: 'close', expected_revision: target.identity.revision, request_id: crypto.randomUUID()}))};
-    if (retainBatch(plan)) resumeBatch();
+    if (new Set(targets.map(id)).size !== targets.length || targets.some(target => { const current = items().find(o => id(o) === id(target)); return !current || !openAlert(current) || current.identity.revision !== target.identity.revision; })) { error('A previewed occurrence changed. Review the current state before creating a plan.'); return; }
+    const plan = {user: state.snapshot.user, index: 0, requests: targets.map(target => ({occurrence_id: id(target), kind, expected_revision: target.identity.revision, request_id: crypto.randomUUID(), ...(kind === 'close' ? {} : {scope: 'occurrence'})}))};
+    if (retainBatch(plan)) { state.batchTargets = new Map(targets.map(target => [id(target), [id(target)]])); return resumeBatch(); }
   }
-  /** Reject superseded responses before they can restore an old authenticated identity. */
-  async function refresh(options = {}) {
-    if (state.fetching || (state.authPaused && !options.reauthenticate)) return;
+  function startRuleBatch(kind, groups) {
+    if (!ready() || !batchKinds.includes(kind) || kind === 'close' || !globalThis.crypto?.randomUUID) return;
+    const plan = {user: state.snapshot.user, index: 0, requests: groups.map(group => ({occurrence_id: id(group.anchor), kind, expected_revision: group.anchor.identity.revision, request_id: crypto.randomUUID(), scope: 'regex', pattern: group.pattern}))};
+    if (retainBatch(plan)) { state.batchTargets = new Map(groups.map(group => [id(group.anchor), group.targets.map(id)])); return resumeBatch(); }
+  }
+  function startCloseBatch(targets) { return startActionBatch('close', targets); }
+  let snapshotRequest = null, snapshotVersion = 0;
+  /** Actions require a fresh read after any older in-flight snapshot has finished. */
+  function refresh(options = {}) {
+    if (state.authPaused && !options.reauthenticate) return Promise.resolve();
+    if (state.fetching) return options.afterAction ? snapshotRequest.then(() => refresh(options)) : snapshotRequest;
+    snapshotRequest = refreshSnapshot(options); return snapshotRequest;
+  }
+  /** Reject superseded responses before they can restore an old identity or pre-action state. */
+  async function refreshSnapshot(options) {
     state.fetching = true; renderStatus();
-    const generation = state.generation;
+    const generation = state.generation, selection = state.pendingSelection, version = snapshotVersion;
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 12000);
     try {
       const response = await fetch('/api/snapshot', {credentials: 'same-origin', cache: 'no-store', signal: controller.signal, headers: {Accept: 'application/json'}});
       const snapshot = await responseJSON(response);
-      if (generation !== state.generation) return;
+      if (generation !== state.generation || version !== snapshotVersion) return;
       if (!response.ok) throw new Error('Snapshot failed (HTTP ' + response.status + '). Actions are paused.');
       if (!snapshot.status || !Array.isArray(snapshot.occurrences) || typeof snapshot.user !== 'string' || !snapshot.user) throw new Error('The server returned an invalid snapshot. Actions are paused.');
       const previous = state.snapshot;
-      if (state.personalUser && state.personalUser !== snapshot.user) {
+      if ((state.personalUser && state.personalUser !== snapshot.user) || (previous && previous.user !== snapshot.user)) {
         closeDesktopNotifications();
         el('action-error').hidden = true; el('action-error').textContent = ''; announce('');
-        state.generation++; state.selected = ''; state.selectedReport = ''; state.pending = null; state.pendingUser = ''; state.batch = null; state.storageUser = null;
-        sopCache.clear(); metricsCache.clear(); sopDisclosures.clear(); metricsDisclosures.clear(); metricsSelections.clear(); state.reportDisclosures.clear(); state.prs = null;
+        state.generation++; state.selected = ''; state.checked.clear(); state.selectedReport = ''; state.pending = null; state.pendingUser = ''; state.batch = null; state.storageUser = null;
+        sopCache.clear(); metricsCache.clear(); sopDisclosures.clear(); metricsDisclosures.clear(); metricsSelections.clear(); state.reportDisclosures.clear(); state.groupDisclosures.clear(); state.prs = null;
         if (el('action-dialog').open) closeDialog();
       }
       state.authPaused = false; state.snapshot = snapshot; state.fetchError = '';
       chaiChat?.update(snapshot);
-      reconcilePersonal(snapshot, previous, options.quiet || !previous || options.reauthenticate); restorePending(snapshot.user);
+      slackThread?.update(snapshot);
+      reconcilePersonal(snapshot, previous, options.quiet || !previous || options.reauthenticate); restorePending(snapshot.user); pruneSelection(); advanceSelection(selection);
       if (state.view === 'unmerged_prs') refreshPRs();
-    } catch (err) { state.wasReady = false; state.fetchError = err.name === 'AbortError' ? 'Snapshot timed out after 12 seconds. Actions are paused; refresh to retry.' : err.message || 'Snapshot unavailable. Actions are paused.'; }
+    } catch (err) { state.wasReady = false; state.fetchError = err.name === 'AbortError' ? 'Snapshot timed out after 12 seconds. Actions are paused; refresh to retry.' : err.message || 'Snapshot unavailable. Actions are paused.'; slackThread?.update(state.authPaused || !state.snapshot ? null : {...state.snapshot, status: {...state.snapshot.status, phase: 'degraded'}}); }
     finally { window.clearTimeout(timeout); state.fetching = false; render(); }
   }
   /** Retain an immutable request identity before its first network attempt. */
-  async function sendNew(kind, occurrence, draft = '', scope = 'occurrence') {
+  async function sendNew(kind, occurrence, draft = '', scope = 'occurrence', targets = [occurrence]) {
     if (!ready()) return;
     if (!globalThis.crypto?.randomUUID) { error('A secure browser context with crypto.randomUUID is required for actions.'); return; }
     const request = {occurrence_id: id(occurrence), kind, expected_revision: occurrence.identity.revision, request_id: crypto.randomUUID()};
@@ -1224,13 +1450,13 @@
     if (kind === 'investigate') request.question = draft;
     const user = state.snapshot.user;
     if (!retainPending(user, request)) return;
-    state.pending = request; state.pendingUser = user; state.pendingUnconfirmed = false;
+    state.pending = request; state.pendingUser = user; state.pendingUnconfirmed = false; state.pendingTargets = targets.map(id);
     await sendPending();
   }
   /** Retain uncertain requests while allowing definite pre-write rejections to release a fresh guard. */
   async function sendPending() {
     if (!state.pending || pendingExpired() || state.sending || state.snapshot?.status?.phase !== 'ready' || state.fetchError || state.storageError || state.pendingUser !== state.snapshot.user) return;
-    const request = state.pending;
+    const request = state.pending, selection = actionSelection(request);
     const user = state.pendingUser, generation = state.generation;
     if (!retainPending(user, request)) return;
     const previouslyUnconfirmed = state.pendingUnconfirmed;
@@ -1254,39 +1480,46 @@
         announce('');
       } else {
         if (!result.occurrence?.identity) throw new Error('The server did not confirm the saved occurrence.');
-        clearPending(user, request); if (!state.pending && !state.storageError) finishBatchRequest(request); state.selected = id(result.occurrence); state.view = result.occurrence.view; state.category = ''; state.color = ''; el('color').value = '';
+        snapshotVersion++;
+        if (selection && selection.version === state.selectionVersion) state.pendingSelection = selection;
+        clearPending(user, request); if (!state.pending && !state.storageError) finishBatchRequest(request);
         const index = items().findIndex(o => id(o) === id(result.occurrence));
         if (index >= 0) state.snapshot.occurrences[index] = result.occurrence;
+        pruneSelection();
         announce('Saved · ' + ({acknowledge: 'WIP started', unacknowledge: 'WIP released', close: 'Investigation closed', reopen: 'Investigation reopened', snooze: 'Snooze rule saved', unsnooze: 'Snooze rule canceled', investigate: 'Chai request saved'})[request.kind] + '.');
         refreshAfter = true;
       }
     } catch (err) { error((err.name === 'AbortError' ? 'Request timed out after 25 seconds.' : err.message || 'Request interrupted.') + ' Delivery is unconfirmed. The original request ID is retained for a safe retry.'); announce(''); }
     finally { window.clearTimeout(timeout); state.sending = false; render(); }
-    if (refreshAfter) await refresh();
+    if (refreshAfter) await refresh({afterAction: true});
   }
   /** Validate the editable draft before creating an explicitly confirmed request. */
   function submitAction(event) {
     event.preventDefault(); const o = state.dialogOccurrence; const draft = el('draft').value.trim();
     const questionError = state.dialogKind === 'investigate' ? chaiQuestionError(draft) : '';
     if (questionError) { el('form-error').textContent = questionError; el('draft').focus(); return; }
-    if (state.dialogScope === 'regex' && !draft) { el('form-error').textContent = 'Enter an identifier regex before sending.'; el('draft').focus(); return; }
+    if (state.dialogScope === 'regex' && !state.dialogTargets.length && !draft) { el('form-error').textContent = 'Enter an identifier regex before sending.'; el('draft').focus(); return; }
     if (!ready()) { el('form-error').textContent = 'Coverage or session is unavailable. Close this preview and refresh before sending.'; return; }
     if (items().find(current => id(current) === id(o))?.identity.revision !== o.identity.revision) { el('form-error').textContent = 'This occurrence changed while the preview was open. Close the preview and review the current state.'; return; }
     if (!state.previewValid) { el('form-error').textContent = 'Wait for a valid server scope preview before sending.'; return; }
-    const kind = state.dialogKind, scope = state.dialogScope, targets = [...state.previewTargets];
+    const kind = state.dialogKind, scope = state.dialogScope, targets = [...state.previewTargets], grouped = state.dialogTargets.length > 0, groups = [...state.previewGroups];
+    if ((kind === 'close' || grouped) && [...targets, ...groups.map(group => group.anchor)].some(target => { const current = items().find(candidate => id(candidate) === id(target)); return !current || !openAlert(current) || current.identity.revision !== target.identity.revision; })) { el('form-error').textContent = 'A previewed occurrence changed. Close the preview and review the current state.'; return; }
+    if (grouped && scope === 'regex' && (groups.length !== state.dialogGroups.length || groups.some((group, index) => group.pattern !== state.dialogGroups[index].pattern))) { el('form-error').textContent = 'The patterns changed. Review a fresh scope preview before sending.'; return; }
     closeDialog();
-    if (kind === 'close' && scope === 'regex') { startCloseBatch(targets); return; }
-    return sendNew(kind, o, draft, scope);
+    if (grouped && scope === 'regex' && kind !== 'close') return startRuleBatch(kind, groups);
+    if (scope === 'selected' || (kind === 'close' && scope === 'regex')) return startActionBatch(kind, targets);
+    return sendNew(kind, o, draft, scope, targets);
   }
   el('refresh').addEventListener('click', () => refresh({quiet: true, reauthenticate: true}));
   el('mark-read').addEventListener('click', () => { for (const o of items()) markRead(o); render(); });
   el('notifications').addEventListener('click', toggleNotifications);
   el('resume-batch').addEventListener('click', resumeBatch); el('cancel-batch').addEventListener('click', discardBatch);
-  for (const input of document.querySelectorAll('input[name="scope"]')) input.addEventListener('change', event => { state.dialogScope = event.target.value; updatePreview(); });
+  for (const input of document.querySelectorAll('input[name="scope"]')) input.addEventListener('change', event => { state.dialogScope = event.target.value === 'occurrence' && state.dialogTargets.length ? 'selected' : event.target.value; updatePreview(); });
   el('retry').addEventListener('click', sendPending);
   el('dismiss-expired').addEventListener('click', dismissExpired);
-  el('search').addEventListener('input', event => { state.query = event.target.value; rememberPreferences(); render(); });
-  el('color').addEventListener('change', event => { state.color = event.target.value; rememberPreferences(); render(); });
+  el('search').addEventListener('input', event => { selectionChanged(); state.query = event.target.value; rememberPreferences(); render(); });
+  el('color').addEventListener('change', event => { selectionChanged(); state.color = event.target.value; rememberPreferences(); render(); });
+  el('group-by-name').addEventListener('change', event => toggleGrouping(event.target.checked));
   el('draft').addEventListener('input', updatePreview);
   el('cancel').addEventListener('click', closeDialog); el('dialog-close').addEventListener('click', closeDialog);
   el('action-dialog').addEventListener('cancel', event => { event.preventDefault(); closeDialog(); });

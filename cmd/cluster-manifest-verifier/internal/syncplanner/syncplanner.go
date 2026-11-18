@@ -17,6 +17,9 @@ import (
 	"github.com/openshift/ci-tools-standalone/cmd/cluster-manifest-verifier/internal/gitchanges"
 )
 
+// GitopsManagedLabel is required on Argo-synced cluster manifests (resource.selectors).
+const GitopsManagedLabel = "ci.openshift.io/gitops-managed"
+
 type Plan struct {
 	Name      string
 	FullSync  bool
@@ -127,8 +130,9 @@ func (p *Planner) parseManifestResources(path string) ([]argov1alpha1.SyncOperat
 			APIVersion string `json:"apiVersion"`
 			Kind       string `json:"kind"`
 			Metadata   struct {
-				Name      string `json:"name"`
-				Namespace string `json:"namespace"`
+				Name      string            `json:"name"`
+				Namespace string            `json:"namespace"`
+				Labels    map[string]string `json:"labels"`
 			} `json:"metadata"`
 		}
 		if err := decoder.Decode(&doc); err != nil {
@@ -142,6 +146,9 @@ func (p *Planner) parseManifestResources(path string) ([]argov1alpha1.SyncOperat
 		}
 		if doc.Kind == "List" {
 			return nil, fmt.Errorf("resource List in %s requires full application sync", path)
+		}
+		if doc.Metadata.Labels[GitopsManagedLabel] != "true" {
+			return nil, fmt.Errorf("resource %s/%s missing label %s=true", doc.Kind, doc.Metadata.Name, GitopsManagedLabel)
 		}
 		group := ""
 		if parts := strings.SplitN(doc.APIVersion, "/", 2); len(parts) == 2 {

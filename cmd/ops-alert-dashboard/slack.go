@@ -19,8 +19,9 @@ import (
 
 // slackArchive keeps Slack credentials and pagination outside the workflow model.
 type slackArchive struct {
-	reader *slack.Client
-	writer *slack.Client
+	reader    *slack.Client
+	writer    *slack.Client
+	directory *slackDirectory
 }
 
 // History fetches every retained parent, including old parents with newer replies.
@@ -116,7 +117,7 @@ func (a *slackArchive) Post(ctx context.Context, channel, rootTS, requestID stri
 	if err != nil {
 		return "", errors.Join(opsalerts.ErrDeliveryFailed, fmt.Errorf("encoding action metadata: %w", err))
 	}
-	if message.Metadata.EventType != opsalerts.ActionMetadataEvent && message.Metadata.EventType != opsalerts.ConversationMetadataEvent {
+	if message.Metadata.EventType != opsalerts.ActionMetadataEvent && message.Metadata.EventType != opsalerts.ConversationMetadataEvent && message.Metadata.EventType != opsalerts.ThreadReplyMetadataEvent {
 		return "", fmt.Errorf("%w: invalid action metadata", opsalerts.ErrDeliveryFailed)
 	}
 	if len(metadata) > opsalerts.MaxActionMetadataBytes {

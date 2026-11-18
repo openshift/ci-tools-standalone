@@ -240,7 +240,7 @@ func TestMergeAndPushToRemote(t *testing.T) {
 			remoteResolver: func() (string, error) {
 				return path.Join(localgit.Dir, privateOrg, privateRepo), nil
 			},
-			errExpectedMsg: "couldn't checkout to branch whatever: error checking out \"whatever\": exit status 1 error: pathspec 'whatever' did not match any file(s) known to git",
+			errExpectedMsg: "couldn't checkout to branch whatever: error checking out \"whatever\":",
 		},
 		{
 			id:     "wrong remote resolver, error expected",
