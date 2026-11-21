@@ -34,6 +34,8 @@ make production-install
 
 ## Testing
 
+<!-- Test-only change to verify automatic triggering of EFS-backed Prow jobs. -->
+
 ```bash
 # Run all unit tests
 make test
