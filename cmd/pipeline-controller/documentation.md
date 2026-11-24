@@ -51,6 +51,8 @@ orgs:
 
 The comment shows the current route and trigger, the next action, and a visible recovery hint. Traditional mode moves straight from waiting to its dispatch outcome. Chai adds an intermediate handoff step and reports the accepted gate mark; the graph points to the **PR status table** below for job runs and results. The original explanation and help commands are under **About the pipeline controller**, collapsed by default.
 
+Completed dispatch steps are green, the active step is blue, and upcoming steps are uncolored. A green outcome means dispatch is complete, not that tests passed.
+
 The normal opening comment is the only progress comment created. Eligible draft PRs get the same welcome text, without a progress graph. After the PR is marked ready for review, the controller can update that comment in place if progress comments are enabled. On a cache miss, one GitHub GraphQL query verifies the current PR revision and looks for the original **Pipeline controller notification** from `openshift-merge-bot[bot]` among the first ten comments. If it is not there or cannot be edited, the controller does not search later pages or post a replacement. Test commands and existing command replies remain separate. On a known active revision, updates use the cached comment ID and skip unchanged text. Verified draft or close events pause updates. A later scheduling event can retry a failed update after a short backoff; there is no polling. The comment is best effort; it does not start jobs or affect the pipeline gate.
 
 ## Three Operating Modes
@@ -95,7 +97,7 @@ In **Automatic Mode**, the pipeline controller automatically triggers second-sta
 
 ### 3. LGTM Mode
 
-In **LGTM Mode**, the pipeline controller triggers second-stage tests when the `lgtm` label is added to a pull request.
+In **LGTM Mode**, the `lgtm` label triggers second-stage dispatch without waiting for stage 1, including when Chai owns dispatch. `/pipeline auto` switches the PR to the stage-one trigger instead. This controls when tests are requested, not which tests must pass to merge.
 
 **How it works:**
 - When a PR is opened, the controller posts an informational comment
@@ -153,9 +155,9 @@ The controller analyzes the files changed in your PR and determines which tests 
 
 ### First-Stage Completion and Pruned Jobs
 
-Prow's sinker deletes completed ProwJobs once they age past its retention window, counted from job start rather than completion. When a late LGTM or override arrives after that, the finished first-stage runs are no longer in the controller's cache, and waiting for a live object would stall the pipeline.
+Prow's sinker deletes completed ProwJobs once they age past its retention window, counted from job start rather than completion. When `/pipeline auto` is used after that, the finished first-stage runs are no longer in the controller's cache, and waiting for a live object would stall automatic dispatch. Ordinary LGTM dispatch does not wait for stage 1.
 
-Live ProwJobs always decide first: a required or conditional first-stage job that is still present and has not succeeded blocks the second stage, with no GitHub traffic. Only always-required jobs that are entirely absent from the cache are decided differently: the controller reads the commit statuses those jobs reported on GitHub for the exact PR HEAD, after confirming the PR is still open, not a draft, and on that same HEAD and target branch. The aggregate combined status is ignored; every missing job's exact context must report success. Jobs that skip reporting, or use the `ci/pipeline-gate` context, cannot be verified this way and keep blocking. Agentic readiness and traditional dispatch use this same check.
+When dispatch waits for stage 1, live ProwJobs decide first: a required or conditional first-stage job that is still present and has not succeeded blocks dispatch, with no GitHub traffic. Only always-required jobs that are entirely absent from the cache are decided differently: the controller reads the commit statuses those jobs reported on GitHub for the exact PR HEAD, after confirming the PR is still open, not a draft, and on that same HEAD and target branch. The aggregate combined status is ignored; every missing job's exact context must report success. Jobs that skip reporting, or use the `ci/pipeline-gate` context, cannot be verified this way and keep blocking. Agentic readiness and traditional dispatch use this same check.
 
 Before any status is read, a shared eligibility guard decides whether the context can be attributed to the PR's base branch at all. GitHub statuses are commit- and context-scoped: a green context proves only that the context succeeded on that commit, not which job, definition or base branch produced it. The guard accepts a context only when the controller's complete static reporting inventory shows exactly one reportable job definition owning it (optional and manually triggered definitions count, contexts are compared case-insensitively as GitHub does, and a postsubmit reporting the same context counts as a second owner because Prow reports postsubmits on base branches), and when the candidate job runs on exactly one branch, written as the canonical pattern `^<base-ref>$`, with no `skip_branches`. Repositories with in-repo config enabled keep an unknown inventory, since in-repo definitions are invisible to it, and decline the fallback entirely.
 
@@ -291,11 +293,11 @@ Custom Chai logins also need separate gate-marking permission.
 1. In automatic mode, applicable first-stage tests pass in the shared ProwJob cache
    (including overrides; jobs pruned by sinker are verified from their commit
    statuses on the current HEAD, see "First-Stage Completion and Pruned Jobs").
-   LGTM mode also requires the current `lgtm` or `pipeline-auto`
-   label set by `/pipeline auto`; either prerequisite may arrive first.
+   In LGTM mode, the current `lgtm` label triggers handoff without waiting for stage 1.
+   `/pipeline auto` switches that PR to the first-stage trigger even if `lgtm` is present.
    Manual mode waits for a trusted user's `/pipeline required` or `/pipeline remaining`.
    In any mode, these commands request handoff immediately without waiting for
-   first-stage success or approval.
+   first-stage success or approval. Dispatch does not mark individual test contexts as passed.
    Create `ci/pipeline-gate` **queued**; `check_run.created` signals Chai and starts its response timeout.
    Reuse the existing gate for the same PR HEAD SHA: repeated manual commands,
    first-stage completion, later LGTM or `pipeline-auto` labels, automatic reconciliation
@@ -309,7 +311,7 @@ Custom Chai logins also need separate gate-marking permission.
    The controller does not parse plans, validate jobs or wait for their results.
 
 Without a Chai comment, the controller returns to traditional selection and `/test`
-dispatch for this revision, respecting first-stage success and auto/manual/LGTM triggers.
+dispatch for this revision, using the current auto, manual, or LGTM trigger.
 Chai must respect the response deadline and must not dispatch after fallback or opt-out;
 Late comments do not reclaim dispatch, and late completion commands are rejected.
 After Chai responds there is no completion timeout: use `/pipeline skip-agentic-mode` for recovery.
@@ -326,8 +328,8 @@ After Chai responds there is no completion timeout: use `/pipeline skip-agentic-
   Chai completion cannot take ownership back on the completed traditional revision.
   An initial failed dispatch without earlier completion can still restore immediately.
   Otherwise, manual mode waits for `/pipeline required` or `/pipeline remaining`.
-  Automatic mode creates fresh readiness after first-stage success; LGTM mode also
-  requires current `lgtm` or `pipeline-auto` approval. Already-agentic PRs are unchanged.
+  Automatic mode creates fresh readiness after first-stage success; LGTM mode uses the
+  current `lgtm` label unless `/pipeline auto` is active. Already-agentic PRs are unchanged.
 - Manual opt-out label removal also preserves completed dispatch. Repeat commands preserve it.
   A completed agentic gate keeps its agentic owner unless an actual traditional
   dispatch or acknowledgment while opted out writes traditional ownership.
@@ -338,9 +340,9 @@ After Chai responds there is no completion timeout: use `/pipeline skip-agentic-
   When the gate already exists, each new command receives a reply explaining that
   Chai is triggered only once per HEAD SHA. The command does not reopen the gate
   or restart its response timeout.
-  `/pipeline auto` sets the existing LGTM auto label and permits readiness after
-  first-stage success without `lgtm`. Removing `lgtm` after readiness preserves the
-  existing gate and response timeout; a new HEAD/base requires current approval again.
+  `/pipeline auto` sets the existing LGTM auto label and waits for first-stage success
+  instead of `lgtm`. Removing `lgtm` after readiness preserves the existing gate and
+  response timeout; a new HEAD/base uses the current trigger again.
   Running tests are never cancelled.
 - Mode commands and help accept LF or CRLF line endings; edited comments do not
   execute mode changes. Confirmation replies are best-effort: a delivery failure

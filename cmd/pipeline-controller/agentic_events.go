@@ -99,8 +99,10 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 				reply("Agentic mode is enabled for the next HEAD SHA. Traditional scheduling still owns this HEAD; its rerun gate is unchanged. Use `/pipeline required` or `/pipeline remaining` to recover the traditional rerun.")
 			} else if cfg.Trigger == "manual" {
 				reply("Agentic mode is restored. Use `/pipeline required` or `/pipeline remaining` to create a pending pipeline gate and trigger Chai for this HEAD. Running tests are unchanged.")
+			} else if pipelineWaitsForFirstStage(cfg.Trigger, pr) {
+				reply("Agentic mode is restored. First-stage success will create a fresh pending pipeline gate. Running tests are unchanged.")
 			} else {
-				reply("Agentic mode is restored. First-stage success will create a fresh pending pipeline gate once the configured trigger is satisfied (LGTM or `/pipeline auto` in LGTM mode). Running tests are unchanged.")
+				reply("Agentic mode is restored. The `lgtm` label triggers a fresh pending pipeline gate without waiting for stage 1. Running tests are unchanged.")
 			}
 		}
 	case "mark-pipeline-gate":
@@ -136,7 +138,7 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			break
 		}
 		if chai && (!s.ready || (!s.publishedAt.IsZero() && !comment.CreatedAt.IsZero() && comment.CreatedAt.Before(s.publishedAt))) {
-			message := "There is no active agentic readiness gate for this revision. Wait for first-stage success and repeat the command."
+			message := "There is no active agentic readiness gate for this revision. Wait for the controller to request Chai handoff before repeating the command."
 			if cfg.Trigger == "manual" {
 				message = "There is no active agentic readiness gate for this revision. A trusted user must first run `/pipeline required` or `/pipeline remaining` to trigger Chai."
 			}

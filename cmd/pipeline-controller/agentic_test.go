@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/config"
 	"sigs.k8s.io/prow/pkg/flagutil"
 	"sigs.k8s.io/prow/pkg/github"
@@ -232,7 +233,13 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 }
 
 func (f *agenticFixture) passFirstStage() {
+	f.setFirstStageState(v1.SuccessState)
+}
+
+// setFirstStageState supplies a live job at the test PR's current revision.
+func (f *agenticFixture) setFirstStageState(state v1.ProwJobState) {
 	pj := makeProwJob("pull-ci-org-repo-"+f.gh.pr.Base.Ref+"-unit", f.gh.pr.Head.SHA)
+	pj.Status.State = state
 	pj.Spec.Refs = pullRefs(f.work.org, f.work.repo, &f.gh.pr)
 	pj.Labels["prow.k8s.io/refs.org"], pj.Labels["prow.k8s.io/refs.repo"] = f.work.org, f.work.repo
 	pj.Labels["prow.k8s.io/refs.base_ref"] = f.gh.pr.Base.Ref
@@ -252,53 +259,45 @@ func (f *agenticFixture) reconcile(t *testing.T, comment *github.IssueComment) {
 
 func (f *agenticFixture) state() *agenticState { return f.a.states[f.work] }
 
-// TestAgenticLGTMReadinessWaitsForApprovalAndFirstStage covers both arrival orders of the readiness prerequisites.
-func TestAgenticLGTMReadinessWaitsForApprovalAndFirstStage(t *testing.T) {
+// TestAgenticLGTMReadiness distinguishes ordinary LGTM from the auto override.
+func TestAgenticLGTMReadiness(t *testing.T) {
 	for _, tc := range []struct {
-		name          string
-		approvalFirst bool
+		name       string
+		labels     []github.Label
+		stageOne   v1.ProwJobState
+		wantChecks int
 	}{
-		{name: "first-stage-success-before-approval"},
-		{name: "approval-before-first-stage-success", approvalFirst: true},
+		{name: "stage one alone does not trigger LGTM mode", stageOne: v1.SuccessState},
+		{name: "LGTM triggers when first-stage records were pruned", labels: []github.Label{{Name: labels.LGTM}}, wantChecks: 1},
+		{name: "LGTM triggers with stage one running", labels: []github.Label{{Name: labels.LGTM}}, stageOne: v1.PendingState, wantChecks: 1},
+		{name: "LGTM triggers with stage one failed", labels: []github.Label{{Name: labels.LGTM}}, stageOne: v1.FailureState, wantChecks: 1},
+		{name: "auto override takes precedence over LGTM", labels: []github.Label{{Name: labels.LGTM}, {Name: PipelineAutoLabel}}},
+		{name: "auto override triggers after stage one without LGTM", labels: []github.Label{{Name: PipelineAutoLabel}}, stageOne: v1.SuccessState, wantChecks: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAgenticFixture(t, "lgtm")
-			if tc.approvalFirst {
-				f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+			f.gh.pr.Labels = tc.labels
+			if tc.stageOne != "" {
+				f.setFirstStageState(tc.stageOne)
 			}
-			if !tc.approvalFirst {
-				f.passFirstStage()
-			}
-			f.reconcile(t, nil)
-			f.now = f.now.Add(2 * f.a.options.timeout)
 			f.reconcile(t, nil)
 			if diff := cmp.Diff(map[string]any{
-				"checks":               0,
+				"checks":               tc.wantChecks,
 				"comments":             0,
 				"status writes":        0,
-				"ready":                false,
-				"timed out":            false,
-				"no response deadline": true,
+				"ready":                tc.wantChecks > 0,
+				"no response deadline": tc.wantChecks == 0,
 			}, map[string]any{
 				"checks":               len(f.gh.checks),
 				"comments":             len(f.gh.comments),
 				"status writes":        f.gh.statusWrites,
 				"ready":                f.state().ready,
-				"timed out":            f.state().timedOut,
 				"no response deadline": f.state().waitingUntil.IsZero(),
 			}); diff != "" {
 				t.Errorf("unexpected result (-want +got):\n%s", diff)
 				return
 			}
-			if tc.approvalFirst {
-				f.passFirstStage()
-			}
-			if !tc.approvalFirst {
-				f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
-			}
-			f.reconcile(t, nil)
-			if diff := cmp.Diff(1, len(f.gh.checks)); diff != "" {
-				t.Errorf("unexpected result (-want +got):\n%s", diff)
+			if tc.wantChecks == 0 {
 				return
 			}
 			if diff := cmp.Diff(map[string]any{
@@ -427,7 +426,6 @@ func TestAgenticLGTMOptOutWaitsForApproval(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAgenticFixture(t, "lgtm")
-			f.passFirstStage()
 			var command *github.IssueComment
 			if tc.command {
 				command = f.command(100, "skip-agentic-mode")
@@ -560,12 +558,14 @@ func TestAgenticReadinessAndCompletion(t *testing.T) {
 	for _, mode := range []string{"auto", "manual", "lgtm"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newAgenticFixture(t, mode)
+			f.reconcile(t, nil)
+			require.Empty(t, f.gh.checks, "no readiness before the configured trigger")
 			if mode == "lgtm" {
 				f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
 			}
-			f.reconcile(t, nil)
-			require.Empty(t, f.gh.checks, "first-stage success must precede CheckRun creation")
-			f.passFirstStage()
+			if mode == "auto" {
+				f.passFirstStage()
+			}
 			f.reconcile(t, &github.IssueComment{ID: 90, Body: "Chai has not seen readiness yet.",
 				User: github.User{Login: "chai[bot]"}, CreatedAt: f.now})
 			if mode == "manual" {
@@ -672,7 +672,9 @@ func TestAgenticResponseTimeoutUsesTraditionalTrigger(t *testing.T) {
 			if trigger == "lgtm" {
 				f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
 			}
-			f.passFirstStage()
+			if trigger == "auto" {
+				f.passFirstStage()
+			}
 			if trigger == "manual" {
 				f.reconcile(t, f.command(1, "required"))
 			}
@@ -786,15 +788,17 @@ func TestAgenticReenableCompletedDispatchPreservesRevision(t *testing.T) {
 					f.reconcile(t, nil)
 					require.Equal(t, []github.CheckRun{completed}, f.gh.checks, "restart must preserve the completed revision")
 					require.Len(t, f.gh.comments, comments, "no redispatch or response timeout for this HEAD")
-					if mode == "lgtm" {
-						f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
-					}
 					f.gh.pr.Head.SHA = strings.Repeat("b", 40)
+					f.gh.pr.Labels = nil
 					f.a.reader = newFakePJLister()
 					f.reconcile(t, nil)
-					require.Len(t, f.gh.checks, 1, "next SHA still waits for first-stage success")
-					f.passFirstStage()
-					if mode == "manual" {
+					require.Len(t, f.gh.checks, 1, "next SHA waits for its configured trigger")
+					switch mode {
+					case "auto":
+						f.passFirstStage()
+					case "lgtm":
+						f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+					case "manual":
 						f.reconcile(t, f.command(400, "required"))
 					}
 					f.reconcile(t, nil)

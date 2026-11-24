@@ -90,18 +90,36 @@ func renderProgress(refs *v1.Refs, v progressView) string {
 		owner, middle = "Chai", ` --> handoff["Agentic dispatching"]`
 	}
 	current, end := "wait", string(progressPosted)
+	var done []string
 	switch v.phase {
 	case progressWaiting:
+		if v.satisfied {
+			done = append(done, "trigger")
+		}
 	case progressChai:
 		current = "handoff"
-	case progressChaiMarked:
-		current = "outcome"
+		done = append(done, "wait", "trigger")
 	default:
-		current, end = "outcome", string(v.phase)
+		current = "outcome"
+		if v.phase != progressChaiMarked {
+			end = string(v.phase)
+		}
+		done = append(done, "wait", "trigger")
+		if v.chai {
+			done = append(done, "handoff")
+		}
+		switch v.phase {
+		case progressPosted, progressChaiMarked, progressEmpty, progressMarked, progressComplete:
+			current = ""
+			done = append(done, "outcome")
+		}
 	}
-	milestone := ""
-	if v.satisfied {
-		milestone = "  class trigger done\n"
+	styles := ""
+	if current != "" {
+		styles = "  class " + current + " here\n"
+	}
+	if len(done) != 0 {
+		styles += "  class " + strings.Join(done, ",") + " done\n"
 	}
 	sha := refs.Pulls[0].SHA
 	sha = html.EscapeString(strings.NewReplacer("`", "&#96;", "\n", "", "\r", "").Replace(sha[:min(12, len(sha))]))
@@ -109,8 +127,8 @@ func renderProgress(refs *v1.Refs, v progressView) string {
 		"```mermaid\nflowchart LR\n  wait[\"Waiting\"] --> trigger[%q]%s --> outcome[%q]\n"+
 		"  classDef here fill:#1757a6,stroke:#1757a6,color:#fff,stroke-width:3px\n"+
 		"  classDef done fill:#dafbe1,stroke:#1a7f37,color:#116329,stroke-width:2px\n"+
-		"  class %s here\n%s```\n\n**If you're stuck:** %s\n\n<details>\n<summary>About the pipeline controller</summary>\n\n%s\n\n</details>",
-		progressPrefix, owner, sha, now, next, v.trigger, middle, end, current, milestone, hint, pipelineNotificationHelp)
+		"%s```\n\n**If you're stuck:** %s\n\n<details>\n<summary>About the pipeline controller</summary>\n\n%s\n\n</details>",
+		progressPrefix, owner, sha, now, next, v.trigger, middle, end, styles, hint, pipelineNotificationHelp)
 }
 
 // copy keeps the usual next action separate from the always-visible recovery path.
@@ -148,8 +166,11 @@ func (v progressView) copy() (now, next, hint string) {
 		if v.trigger == progressManual {
 			return "Waiting for a request to notify Chai.", "A trusted user can use `/pipeline remaining` or `/pipeline required`.", "To use Traditional instead, a trusted user can run `/pipeline skip-agentic-mode`."
 		}
-		if v.trigger == progressLGTM && !v.satisfied {
-			return "Waiting for `/lgtm`.", "Ask a reviewer for `/lgtm`.", "A trusted user can use `/pipeline auto` to wait only for stage 1, or `/pipeline required` to notify Chai now."
+		if v.trigger == progressLGTM {
+			if !v.satisfied {
+				return "Waiting for `/lgtm`.", "Ask a reviewer for `/lgtm`.", "A trusted user can use `/pipeline auto` to wait only for stage 1, or `/pipeline required` to notify Chai now."
+			}
+			return "Waiting to notify Chai.", "The PR has `/lgtm`; stage 1 is not required for handoff.", hint
 		}
 		return "Waiting for stage 1 before notifying Chai.", pending, hint
 	}
@@ -158,8 +179,11 @@ func (v progressView) copy() (now, next, hint string) {
 		return "The controller posted stage-2 test requests.", results, "Use `/test <job>` for one failed or missing run."
 	case v.trigger == progressManual:
 		return "Waiting for a request to run stage 2.", "Use `/pipeline remaining` to request missing jobs.", "Use `/pipeline required` for the full applicable set, or `/test <job>` for one job."
-	case v.trigger == progressLGTM && !v.satisfied:
-		return "Waiting for `/lgtm`.", "Ask a reviewer for `/lgtm`.", "Use `/pipeline auto` to wait for stage 1 instead, or `/pipeline remaining` for missing jobs now."
+	case v.trigger == progressLGTM:
+		if !v.satisfied {
+			return "Waiting for `/lgtm`.", "Ask a reviewer for `/lgtm`.", "Use `/pipeline auto` to wait for stage 1 instead, or `/pipeline remaining` for missing jobs now."
+		}
+		return "Waiting to request stage-2 jobs.", "The PR has `/lgtm`; stage 1 is not required for dispatch.", "Use `/pipeline remaining` to request missing stage-2 jobs now."
 	default:
 		return "Waiting for stage 1.", pending, "Use `/pipeline remaining` to request missing stage-2 jobs now."
 	}

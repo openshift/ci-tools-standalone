@@ -12,7 +12,6 @@ import (
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/github"
-	"sigs.k8s.io/prow/pkg/labels"
 )
 
 const agenticSkipLabel = "pipeline-skip-agentic-mode"
@@ -121,6 +120,11 @@ func hasAgenticLabel(pr *github.PullRequest, name string) bool {
 	return false
 }
 
+// pipelineWaitsForFirstStage preserves the ordinary LGTM trigger unless the PR opted into auto.
+func pipelineWaitsForFirstStage(trigger string, pr *github.PullRequest) bool {
+	return trigger == "auto" || (trigger == "lgtm" && hasAgenticLabel(pr, PipelineAutoLabel))
+}
+
 func (a *agenticController) trustedChai(login string) bool {
 	for _, author := range a.options.trustedAuthors.Strings() {
 		if strings.EqualFold(login, author) {
@@ -226,10 +230,12 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 			if !pipelineGateTriggerSatisfied(cfg.Trigger, pr) {
 				return nil
 			}
-			pj := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: pullRefs(work.org, work.repo, pr)}}
-			complete, err := checkFirstStageComplete(ctx, a.reader, a.gh, pj, a.configDataProvider.GetPresubmits(work.org+"/"+work.repo))
-			if err != nil || !complete {
-				return err
+			if pipelineWaitsForFirstStage(cfg.Trigger, pr) {
+				pj := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: pullRefs(work.org, work.repo, pr)}}
+				complete, err := checkFirstStageComplete(ctx, a.reader, a.gh, pj, a.configDataProvider.GetPresubmits(work.org+"/"+work.repo))
+				if err != nil || !complete {
+					return err
+				}
 			}
 			s.progress.trigger = waitingProgress(cfg, pr, true).trigger
 		}
@@ -360,15 +366,16 @@ func (a *agenticController) dispatchTraditional(ctx context.Context, work agenti
 	if err := a.checks.pending(pullRefs(work.org, work.repo, pr)); err != nil {
 		return err
 	}
-	shouldDispatch := cfg.Trigger == "auto" || (cfg.Trigger == "lgtm" && (hasAgenticLabel(pr, PipelineAutoLabel) || hasAgenticLabel(pr, labels.LGTM)))
-	if !shouldDispatch {
+	if cfg.Trigger != "auto" && cfg.Trigger != "lgtm" {
 		return nil
 	}
 	pj := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: pullRefs(work.org, work.repo, pr)}}
 	presubmits := a.configDataProvider.GetPresubmits(work.org + "/" + work.repo)
-	complete, err := checkFirstStageComplete(ctx, a.reader, a.gh, pj, presubmits)
-	if err != nil || !complete {
-		return err
+	if pipelineWaitsForFirstStage(cfg.Trigger, pr) {
+		complete, err := checkFirstStageComplete(ctx, a.reader, a.gh, pj, presubmits)
+		if err != nil || !complete {
+			return err
+		}
 	}
 	s.progress.trigger = waitingProgress(cfg, pr, false).trigger
 	if err := sendCommentWithMode(presubmits, pj, a.gh, func() {}, a.reader, modeDelta, false, a.checks, &s.progress.outcome); err != nil {

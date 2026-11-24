@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
@@ -20,7 +21,9 @@ func TestProgressCopy(t *testing.T) {
 		want []string
 		omit string
 	}{
-		{name: "traditional no fake intermediate step", view: progressView{trigger: progressStageOne, satisfied: true, phase: progressPosted}, want: []string{"class trigger done", "class outcome here", "posted stage-2 test requests", "**PR status table** below"}, omit: "Agentic dispatching"},
+		{name: "traditional no fake intermediate step", view: progressView{trigger: progressStageOne, satisfied: true, phase: progressPosted}, want: []string{"posted stage-2 test requests", "**PR status table** below"}, omit: "Agentic dispatching"},
+		{name: "LGTM handoff does not wait for stage one", view: progressView{trigger: progressLGTM, satisfied: true, chai: true}, want: []string{"Waiting to notify Chai."}, omit: "Waiting for stage 1"},
+		{name: "traditional LGTM dispatch does not wait for stage one", view: progressView{trigger: progressLGTM, satisfied: true}, want: []string{"Waiting to request stage-2 jobs."}, omit: "Waiting for stage 1"},
 		{name: "auto override still needs stage one", view: waitingProgress(RepoConfig{Trigger: "lgtm"}, &github.PullRequest{Labels: []github.Label{{Name: PipelineAutoLabel}}}, true), want: []string{"Auto enabled", "class trigger done", "class wait here", "Waiting for stage 1", "**PR status table** below"}},
 		{name: "live Chai deadline", view: progressView{trigger: progressManual, satisfied: true, phase: progressChai, chai: true, deadline: time.Unix(1, 0)}, want: []string{"class handoff here", "before the timeout", "**If you're stuck:**", "/pipeline skip-agentic-mode"}},
 		{name: "Chai replied without finishing", view: progressView{trigger: progressLGTM, phase: progressChai, chai: true, replied: true}, want: []string{"no automatic fallback after a reply", "/pipeline skip-agentic-mode"}},
@@ -45,6 +48,38 @@ func TestProgressCopy(t *testing.T) {
 			}
 			if _, executable := parsePipelineCommand(body); executable || strings.Contains(body, "\n/test ") {
 				t.Error("progress comment contains an executable command")
+			}
+		})
+	}
+}
+
+// TestProgressStageColors checks that only completed steps turn green.
+func TestProgressStageColors(t *testing.T) {
+	refs := &v1.Refs{Pulls: []v1.Pull{{SHA: "aaaa1111"}}}
+	for _, tc := range []struct {
+		name string
+		view progressView
+		want []string
+	}{
+		{name: "waiting for LGTM", view: progressView{trigger: progressLGTM, chai: true}, want: []string{"wait here"}},
+		{name: "LGTM reached before handoff", view: progressView{trigger: progressLGTM, satisfied: true, chai: true}, want: []string{"wait here", "trigger done"}},
+		{name: "Chai dispatch in progress", view: progressView{trigger: progressLGTM, phase: progressChai, chai: true}, want: []string{"handoff here", "wait,trigger done"}},
+		{name: "Chai dispatch complete", view: progressView{trigger: progressLGTM, phase: progressChaiMarked, chai: true}, want: []string{"wait,trigger,handoff,outcome done"}},
+		{name: "traditional jobs requested", view: progressView{trigger: progressStageOne, phase: progressPosted}, want: []string{"wait,trigger,outcome done"}},
+		{name: "no new jobs needed", view: progressView{trigger: progressManual, phase: progressEmpty}, want: []string{"wait,trigger,outcome done"}},
+		{name: "recovered completion", view: progressView{trigger: progressStageOne, phase: progressComplete, chai: true}, want: []string{"wait,trigger,handoff,outcome done"}},
+		{name: "gate acknowledged", view: progressView{trigger: progressLGTM, phase: progressMarked}, want: []string{"wait,trigger,outcome done"}},
+		{name: "dispatch unconfirmed", view: progressView{trigger: progressLGTM, phase: progressFailed}, want: []string{"outcome here", "wait,trigger done"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []string
+			for line := range strings.SplitSeq(renderProgress(refs, tc.view), "\n") {
+				if class, ok := strings.CutPrefix(line, "  class "); ok {
+					got = append(got, class)
+				}
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
 			}
 		})
 	}
