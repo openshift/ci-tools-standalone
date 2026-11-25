@@ -51,7 +51,7 @@ $ gpu-scheduling-webhook --cert-dir=<cert-dir> --port=443`,
 )
 
 func init() {
-	rootCmd.Flags().StringVar(&opts.certDir, "cert-dir", "", "A folder holding the server private key and and certicate for TLS")
+	rootCmd.Flags().StringVar(&opts.certDir, "cert-dir", "", "A folder holding the server private key and and certificate for TLS")
 	rootCmd.Flags().StringVar(&opts.healthProbeAddr, "health-probe-addr", ":8081", "Health probe binding address <addr>:<port>. Default to :8081")
 	rootCmd.Flags().IntVar(&opts.port, "port", 0, "Port the server will listen on")
 }
