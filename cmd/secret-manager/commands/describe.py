@@ -42,9 +42,9 @@ NOT_SET = "(not set)"
 def describe(output: str, collection: str, secret_path: str):
     """Show the metadata associated with a secret.
 
-    Displays the JIRA project, rotation instructions, and request information
-    that were provided when the secret was created. The secret value is never
-    shown.
+    Displays creation times for the secret and its latest version, plus the
+    JIRA project, rotation instructions, and request information. The secret
+    value is never shown.
 
     The SECRET_PATH should be in the format 'group/field' (e.g., 'aws/password').
     """
@@ -79,8 +79,33 @@ def describe(output: str, collection: str, secret_path: str):
     if gcp_secret.create_time:
         create_time = gcp_secret.create_time.strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    latest_version_create_time = NOT_SET
+    try:
+        latest_version = client.get_secret_version(
+            request={"name": f"{full_secret_path}/versions/latest"}
+        )
+        if latest_version.create_time:
+            latest_version_create_time = latest_version.create_time.strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
+    except NotFound:
+        pass  # Secrets can exist without any versions.
+    except PermissionDenied:
+        latest_version_create_time = "(unavailable)"
+        click.echo(
+            "Warning: you don't have permission to view the latest version's metadata.",
+            err=True,
+        )
+    except Exception as e:
+        if is_login_error(e):
+            raise  # reported by main
+        raise click.ClickException(
+            f"Failed to describe the latest version of secret '{secret_path}': {e}."
+        ) from e
+
     metadata = {
         "create-time": create_time,
+        "latest-version-create-time": latest_version_create_time,
         JIRA_LABEL: labels.get(JIRA_LABEL, NOT_SET),
         ROTATION_INSTRUCTIONS: annotations.get(ROTATION_INSTRUCTIONS, NOT_SET),
         REQUEST_INFO: annotations.get(REQUEST_INFO, NOT_SET),
@@ -90,7 +115,8 @@ def describe(output: str, collection: str, secret_path: str):
         click.echo(json.dumps(metadata, indent=2))
         return
 
-    click.echo(f"Created:               {metadata['create-time']}")
-    click.echo(f"JIRA project:          {metadata[JIRA_LABEL]}")
-    click.echo(f"Rotation instructions: {metadata[ROTATION_INSTRUCTIONS]}")
-    click.echo(f"Request information:   {metadata[REQUEST_INFO]}")
+    click.echo(f"Created:                {metadata['create-time']}")
+    click.echo(f"Latest version created: {metadata['latest-version-create-time']}")
+    click.echo(f"JIRA project:           {metadata[JIRA_LABEL]}")
+    click.echo(f"Rotation instructions:  {metadata[ROTATION_INSTRUCTIONS]}")
+    click.echo(f"Request information:    {metadata[REQUEST_INFO]}")

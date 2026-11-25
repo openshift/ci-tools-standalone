@@ -30,7 +30,7 @@ Users in the `openshift/release` repository run:
 # List secrets in a collection
 ./hack/secret-manager.sh list -c my-collection
 
-# Show a secret's metadata (creation date, ownership info; never the value)
+# Show a secret's metadata (secret/version creation dates, ownership; never the value)
 ./hack/secret-manager.sh describe -c my-collection aws/access-key-id
 
 # Create a secret
