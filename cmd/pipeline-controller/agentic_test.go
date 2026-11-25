@@ -1349,7 +1349,13 @@ func TestAgenticRetargetInvalidatesCompletionBeforeReadiness(t *testing.T) {
 	f := newAgenticFixture(t, "auto")
 	f.a.watcher.config.Orgs[0].Repos[0].Branches = []string{"main", "release"}
 	presubmits := f.a.configDataProvider.updatedPresubmits["org/repo"]
-	presubmits.alwaysRequired = append(presubmits.alwaysRequired, config.Presubmit{JobBase: config.JobBase{Name: "pull-ci-org-repo-release-unit"}, AlwaysRun: true})
+	releaseUnit := []config.Presubmit{{
+		JobBase:   config.JobBase{Name: "pull-ci-org-repo-release-unit"},
+		Brancher:  config.Brancher{Branches: []string{"^release$"}},
+		AlwaysRun: true,
+	}}
+	require.NoError(t, config.SetPresubmitRegexes(releaseUnit))
+	presubmits.alwaysRequired = append(presubmits.alwaysRequired, releaseUnit[0])
 	f.a.configDataProvider.updatedPresubmits["org/repo"] = presubmits
 	f.passFirstStage()
 	f.reconcile(t, nil)

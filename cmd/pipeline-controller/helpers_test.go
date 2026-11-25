@@ -662,6 +662,12 @@ func TestPlanDispatchCommentTerminalReportedJobs(t *testing.T) {
 		}},
 		statusContextOwners: map[string]string{"ci/protected": protectedJob, "ci/conditional": conditionalJob},
 	}
+	if err := config.SetPresubmitRegexes(presubmits.protected); err != nil {
+		t.Fatalf("compile protected presubmit branch rules: %v", err)
+	}
+	if err := config.SetPresubmitRegexes(presubmits.pipelineConditionallyRequired); err != nil {
+		t.Fatalf("compile conditional presubmit branch rules: %v", err)
+	}
 	changes := []github.PullRequestChange{{Filename: "cmd/main.go"}}
 	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
 		Head: github.PullRequestBranch{SHA: sha}, Base: github.PullRequestBranch{Ref: baseRef}}
@@ -890,6 +896,12 @@ func TestCheckFirstStageCompletePrunedJobFallback(t *testing.T) {
 		conditionallyRequired: []config.Presubmit{images},
 		statusContextOwners:   map[string]string{"ci/unit": unitJob, "ci/build": buildJob, "ci/images": imagesJob},
 	}
+	if err := config.SetPresubmitRegexes(standard.alwaysRequired); err != nil {
+		t.Fatalf("compile required presubmit branch rules: %v", err)
+	}
+	if err := config.SetPresubmitRegexes(standard.conditionallyRequired); err != nil {
+		t.Fatalf("compile conditional presubmit branch rules: %v", err)
+	}
 	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
 		Head: github.PullRequestBranch{SHA: sha}, Base: github.PullRequestBranch{Ref: baseRef, SHA: "advanced-base-000000"}}
 	// The aggregate state must be ignored; only the exact job contexts count.
@@ -1100,6 +1112,9 @@ func TestFirstStageStatusFallbackRequiresAttributableContext(t *testing.T) {
 				}},
 				statusContextOwners: tc.owners,
 			}
+			if err := config.SetPresubmitRegexes(presubmits.alwaysRequired); err != nil {
+				t.Fatalf("compile required presubmit branch rules: %v", err)
+			}
 			ghc := &fakeGhClient{pullRequest: openPR, combinedStatus: passing}
 
 			complete, err := checkFirstStageComplete(context.Background(), newFakePJLister(), ghc, makeTriggerPJ(sha), presubmits)
@@ -1181,6 +1196,9 @@ func TestDeltaStatusFallbackRequiresAttributableContext(t *testing.T) {
 					RerunCommand: "/test " + protectedJob,
 				}},
 				statusContextOwners: tc.owners,
+			}
+			if err := config.SetPresubmitRegexes(presubmits.protected); err != nil {
+				t.Fatalf("compile protected presubmit branch rules: %v", err)
 			}
 			gh := &fakeAgenticGitHub{pr: *openPR, combinedStatus: terminal}
 
