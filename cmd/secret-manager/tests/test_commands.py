@@ -1,12 +1,15 @@
 """Test the commands that write to Google Secret Manager directly."""
 
+import json
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 from google.api_core.exceptions import DeadlineExceeded, InvalidArgument, NotFound, PermissionDenied, RetryError, ServiceUnavailable
+from google.cloud import secretmanager
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from commands.create import create as create_command
@@ -152,6 +155,66 @@ class CommandsTest(unittest.TestCase):
                 result = self.run_command(describe_command, "describe", ["-c", "my-collection", "aws/key"], client)
                 self.assertEqual(result.exit_code, want_exit, result.output)
                 self.assertEqual(isinstance(result.exception, ServiceUnavailable), get_error is not None)
+                if get_error is not None:
+                    client.get_secret_version.assert_not_called()
+                self.assert_index_untouched(client)
+
+    def test_describe_latest_version(self):
+        created = datetime(2025, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        updated = datetime(2025, 6, 7, 8, 9, 10, tzinfo=timezone.utc)
+        for name, version_time, version_error, want_exit, want_time, want_error in [
+            ("latest version creation time", updated, None, 0, "2025-06-07 08:09:10 UTC", ""),
+            ("missing version timestamp", None, None, 0, "(not set)", ""),
+            ("no versions", None, NotFound("missing"), 0, "(not set)", ""),
+            ("version metadata permission denied", None, PermissionDenied("denied"),
+             0, "(unavailable)", "Warning: you don't have permission"),
+            ("Google error", None, DeadlineExceeded("slow"),
+             1, None, "Failed to describe the latest version of secret 'aws/key'"),
+            ("Google outage", None, ServiceUnavailable("backend unavailable"),
+             1, None, "Failed to describe the latest version of secret 'aws/key'"),
+            ("expired login", None, ServiceUnavailable(EXPIRED_LOGIN), 1, None, ""),
+            ("expired login retry timeout", None, RetryError("timeout", ServiceUnavailable(EXPIRED_LOGIN)),
+             1, None, ""),
+        ]:
+            for output in ["text", "json"]:
+                with self.subTest(name=name, output=output):
+                    client = fake_client()
+                    client.get_secret.return_value = secretmanager.Secret(
+                        create_time=created,
+                        labels={"jira-project": "TEST"},
+                        annotations={
+                            "rotation-instructions": "Rotate regularly",
+                            "request-information": "Ask the owner",
+                        },
+                    )
+                    client.get_secret_version.return_value = secretmanager.SecretVersion(
+                        create_time=version_time
+                    )
+                    client.get_secret_version.side_effect = version_error
+                    result = self.run_command(
+                        describe_command, "describe",
+                        ["-c", "my-collection", "aws/key", "-o", output], client,
+                    )
+                    self.assertEqual(result.exit_code, want_exit, result.output)
+                    self.assertIn(want_error, result.stderr)
+                    if want_exit == 0:
+                        if output == "json":
+                            self.assertEqual(json.loads(result.stdout), {
+                                "create-time": "2025-01-02 03:04:05 UTC",
+                                "latest-version-create-time": want_time,
+                                "jira-project": "TEST",
+                                "rotation-instructions": "Rotate regularly",
+                                "request-information": "Ask the owner",
+                            })
+                        else:
+                            self.assertIn("Created:                2025-01-02 03:04:05 UTC", result.stdout)
+                            self.assertIn(f"Latest version created: {want_time}", result.stdout)
+                    elif not want_error:
+                        self.assertIs(result.exception, version_error)
+                    client.get_secret_version.assert_called_once_with(request={
+                        "name": f"projects/openshift-ci-secrets/secrets/{SECRET_ID}/versions/latest"
+                    })
+                    self.assert_index_untouched(client)
 
     def test_get_service_account(self):
         for name, access_error, want_exit in [
